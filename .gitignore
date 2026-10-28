@@ -18,3 +18,9 @@ docs/pnpm-debug.log*
 
 # Local CLI build/test output
 dist/
+
+# Local Benchmark and tests
+Benchmark/
+tests/
+
+.vscode/

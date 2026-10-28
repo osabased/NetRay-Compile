@@ -1,16 +1,28 @@
-# NetRay Studio Plugin (Rojo)
+# NetRay Studio Plugin v0.2.0
 
-This folder contains a local Roblox Studio plugin that compiles NetRay IDL with no HTTP requests.
+The plugin compiles IDL locally and writes `Server`, `Client`, `Types`, and a commented `Schema` reference under `ReplicatedStorage/NetRay`.
 
-For full language/runtime reference docs, see [`../docs/index.md`](../docs/index.md).
+The compiler under `Compiler/` mirrors `../src/`. Only require paths differ: CLI imports use relative filesystem paths, while Studio imports use `script.Parent` references. Make compiler changes in `src/`, then mirror them. UI changes belong in `NetRayCompilerPlugin.server.luau`.
 
-This is essentially a mirror of `src` but for the plugin, with a Plugin Script for Plugin UI 
-Plugin Edits should be for the UI/Plugin Script and not the compiler itself
-Compiler changes are to be done in `src`  
+## Build the Plugin
 
-Output is always written to:
+From the repository root:
 
-- `ReplicatedStorage/NetRay/Server`
-- `ReplicatedStorage/NetRay/Client`
-- `ReplicatedStorage/NetRay/Types`
-- `ReplicatedStorage/NetRay/Schema`
+```sh
+rokit install
+rojo build Roblox-Plugin/plugin.project.json --output dist/NetRayCompilerPlugin.rbxm
+```
+
+The project includes the entire `Compiler/` directory, including `generator/Compression.luau`, and sets the plugin script's RunContext to Plugin. Import or publish the built model using your usual Studio plugin workflow.
+
+`default.project.json` is for a development place containing the plugin under ReplicatedStorage; `plugin.project.json` produces the standalone plugin model.
+
+The local compiler regression checks verify source parity after normalizing import paths. Release packaging does not run unit tests.
+
+## Updating Generated Code
+
+An updated plugin does not modify previously generated modules automatically. Recompile the schema and replace Server, Client and Types together. Existing schemas keep their default validation/struct modes; new rate limits, operational caps and compression are optional.
+
+The plugin refuses output class conflicts instead of deleting existing objects.
+
+See the [documentation](../docs/index.md), [plugin workflow](../docs/studio-plugin-workflow.md), and [release notes](../docs/changelog.md).

@@ -63,32 +63,7 @@ export type DecodeVarCursor = {
 
 local EMPTY_PARAMS: { Ast.Param } = {}
 
-local LUAU_KEYWORDS: { [string]: boolean } = {
-    ["and"] = true,
-    ["break"] = true,
-    ["do"] = true,
-    ["else"] = true,
-    ["elseif"] = true,
-    ["end"] = true,
-    ["false"] = true,
-    ["for"] = true,
-    ["function"] = true,
-    ["if"] = true,
-    ["in"] = true,
-    ["local"] = true,
-    ["nil"] = true,
-    ["not"] = true,
-    ["or"] = true,
-    ["repeat"] = true,
-    ["return"] = true,
-    ["then"] = true,
-    ["true"] = true,
-    ["until"] = true,
-    ["while"] = true,
-    ["continue"] = true,
-    ["export"] = true,
-    ["type"] = true,
-}
+local LUAU_KEYWORDS = Ast.LUAU_KEYWORDS
 
 local PRIMITIVE_BYTES: { [string]: number } = {
     u8 = 1,

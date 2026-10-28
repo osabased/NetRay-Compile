@@ -1,53 +1,61 @@
 # FAQ
 
-## Is there a CLI?
-Yes.
+## Do I need to add options when updating?
 
-Install it with Rokit:
+No. `Validate = Off`, `TypeBranding = Off`, and `DecodeStruct = Locals` remain the defaults. All new operational limits default to `0` (disabled), and events have no rate/size policy or delta compression unless requested in the schema.
 
-```sh
-rokit add AstaWasTaken/NetRay-Compile@<version> netray
-```
+Regenerate Server, Client and Types together even when the schema is unchanged. See the [migration notes](/changelog#v0-2-0).
 
-Run it with:
+## Does zero mean that messages are forbidden?
 
-```sh
-netray compile path/to/schema.idl --out-dir generated --scope NetRay
-```
+For file-level limits, `0` means disabled. Event-level `Rate`, `Burst`, and `Max` require positive values; omit those properties to disable them.
 
-## Where are generated modules written?
-Studio plugin output path:
-- `ReplicatedStorage/NetRay/Server`
-- `ReplicatedStorage/NetRay/Client`
-- `ReplicatedStorage/NetRay/Types`
-- `ReplicatedStorage/NetRay/Schema`
+## Is delta compression automatic?
 
-## Does `option remote_scope` control remote names?
-Yes. The plugin compiler and `src/Compiler.luau` both honor `option remote_scope`.
+No. Add `Compression: Repeat` or `Compression: Fields` to a reliable event to enable it. Omit `Compression` to disable it; `Compression: Off` is not a supported value.
 
-Remote names follow: `<Scope>_RELIABLE`, `<Scope>_UNRELIABLE`, `<Scope>_FUNCTION`.
+Repeat sends a marker for an identical serialized body. Fields can omit unchanged fixed-width arguments using a mask. Every event still reaches its handler when accepted; this does not suppress repeated callbacks.
 
-## Can server send an event to one player directly?
-Yes, generated server APIs include `Fire(player, ...)` when server send direction is allowed.
+## Can unreliable events use delta compression?
 
-## Can I register multiple callbacks for one message?
-It depends on `Call` mode:
-- `SingleSync` / `SingleAsync`: single active handler.
-- `ManySync` / `ManyAsync`: multiple handlers.
-- `Polling`: no callbacks; consume via `Iter()`.
+No. The compiler rejects that combination. A lost unreliable packet could otherwise leave the receiver without the required baseline.
 
-## Are enums supported?
-Yes.
-- Unit enums are emitted as Luau string-literal unions.
-- Tagged enums are emitted as tagged table unions and serialized on the wire.
+## Does a smaller buffer mean the same percentage less bandwidth?
 
-## What do `Call` and `Yield` modes do?
-- Event `Call` controls receive API shape (`On` single/multi vs `Iter` polling).
-- Function `Yield` currently supports only `SingleSync`.
+No. NetRay reduces the buffer before Roblox applies its own transport processing. Repetition, batching, passthrough values and call frequency affect the result. Benchmark changing data as well as repeated data.
 
-## Why are callbacks receiving expanded struct fields?
-You are using `option DecodeStruct = Locals` (default).
-Use `option DecodeStruct = Table` to receive struct tables.
+## Do per-event rate limits stop all oversized-buffer attacks?
 
-## Why are dropped stats often zero?
-The runtime exposes drop counters, but many schemas and workloads will not trigger queue drops under normal conditions.
+No. Finding the next event can require skipping its schema, and compressed records may need decoding to keep their baseline valid. Optional call/byte receive budgets reject work earlier. Limits also do not replace gameplay permission checks. See [options](/options).
+
+## Where do I compile and find the output?
+
+Use the [Studio plugin](/studio-plugin-workflow) or [CLI](/cli-workflow). Studio writes `Server`, `Client`, `Types` and a commented `Schema` under `ReplicatedStorage/NetRay`. The CLI writes three Luau modules, `Schema.idl`, and `CompileInfo.txt` to the chosen output folder.
+
+## Does remote_scope change the output folder?
+
+No. It changes the three remote names and overrides the frontend's fallback scope. Separate generated protocols need distinct remote scopes.
+
+## Can the server target selected players?
+
+Yes. Server event APIs provide `Fire(player, ...)`, `FireAll(...)`, `FireList(players, ...)`, and `FireExcept(player, ...)` when the schema permits server sending.
+
+## Can I register multiple callbacks?
+
+Use `ManySync` or `ManyAsync`. Single modes replace the current handler. `On` returns a connection with `Disconnect()`. Polling events use `Iter()` instead of `On`.
+
+## Why do callbacks receive separate struct fields?
+
+`DecodeStruct = Locals` is the default for top-level struct parameters. Set `DecodeStruct = Table` to receive each struct as a table. Arrays of structs remain arrays.
+
+## Why did my polling loop change after upgrading?
+
+The iterator now returns an index before the payload. Use `for _, value in Event.Iter() do` on a client, or `for _, player, value in Event.Iter() do` on a server. This allows nil payload arguments without ending iteration.
+
+## Why are drop counters zero even when data is rejected?
+
+The exposed counters cover outgoing drops. They do not count every receive-side rejection, measure delivery, or acknowledge server processing.
+
+## Is the compiler version negotiated at runtime?
+
+No. Both sides must use output from the same schema and compiler version. Deploy generated modules as a matching set.

@@ -1,21 +1,17 @@
+option remote_scope = "NetRay";
+// Controlled Studio load test;
+option ReceiveBytesPerSecond = 67108864;
+option ReceiveByteBurst = 67108864;
+option ReceiveCallsPerSecond = 100000;
+option ReceiveCallBurst = 100000;
+option ReceiveMessagesPerSecond = 1000000;
+option ReceiveMessageBurst = 1000000;
 struct Entities {
-		brand : string,
-		carName : string,
-		carId : u16,
-		available : boolean,
-		dealers : u8,
-		price : f64
+	brand: string<32>, carName: string<32>, carId: u16,
+	available: bool, dealers: u8, price: f64
 }
-
-event MyEvent {
-	From: Client,
-	Type: Reliable,
-	Call: SingleSync,
-	Data: Entities
-}
-
-function Ping {
-  Yield: SingleSync,
-  Data: (f64),
-  Return: (f64),
-}
+event MyEvent { From: Client, Type: Reliable, Call: SingleSync, Data: Entities }
+event RawState { From: Server, Type: Reliable, Call: SingleSync, Data: (u32, u32, u32) }
+event RepeatState { From: Server, Type: Reliable, Call: SingleSync, Compression: Repeat, Data: (u32, u32, u32) }
+event FieldState { From: Server, Type: Reliable, Call: SingleSync, Compression: Fields, Data: (u32, u32, u32) }
+function Ping { Yield: SingleSync, Data: (f64), Return: (f64) }

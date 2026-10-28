@@ -1,241 +1,181 @@
+-- Run as a LocalScript in StarterPlayerScripts in the benchmark place.
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+assert(RunService:IsStudio(), "Run this benchmark in Studio only")
 
-local Compiled = require(ReplicatedStorage.Shared.NetRay.Client)
-local Entities = require(ReplicatedStorage.Entities)
-local Blink = require(ReplicatedStorage.Shared.Blink.Client)
+local Net = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("NetRay"):WaitForChild("Client"))
+local Control = ReplicatedStorage:WaitForChild("NetRayBenchmarkControl")
+local Reliable = ReplicatedStorage:WaitForChild("NetRay_RELIABLE")
+local CONFIG = { runs = 2, steps = 600, perStep = 40, drainTimeout = 10, pingSamples = 30 }
 
-local BlinkEvent = Blink.MyEvent
-local NetRayEvent = Compiled.MyEvent
-
-local BlinkPing = Blink.Ping
-local NetRayPing = Compiled.Ping
-
-local amountFrames = 3000
-local firesPerFrame = 50
-
-local CFG = {
-	runs = 5,
-
-	durationSec = 8,
-	firesPerStep = 200,
-	yieldEverySteps = 1,
-
-	pingSamples = 60,
-	pingWarmup = 5,
-	pingGapSec = 0.02,
-}
-
-local entityCount = #Entities
-
-local function avg(a)
-	local s = 0
-	for i = 1, #a do s += a[i] end
-	return #a > 0 and (s / #a) or 0
+local entities = table.create(1000)
+for id = 1, 1000 do
+    entities[id] = {
+        brand = "NetRay", carName = "Car" .. id, carId = id,
+        available = id % 2 == 0, dealers = id % 16, price = id * 123.5,
+    }
 end
 
-local function med(a)
-	local t = table.clone(a)
-	table.sort(t)
-	local n = #t
-	if n == 0 then return 0 end
-	if n % 2 == 1 then
-		return t[(n + 1) // 2]
-	end
-	return (t[n // 2] + t[n // 2 + 1]) * 0.5
+local function percentile(values, fraction)
+    if #values == 0 then return 0 end
+    local sorted = table.clone(values)
+    table.sort(sorted)
+    return sorted[math.clamp(math.ceil(#sorted * fraction), 1, #sorted)]
 end
 
-local function pctl(a, p)
-	local t = table.clone(a)
-	table.sort(t)
-	local n = #t
-	if n == 0 then return 0 end
-	local k = math.clamp(math.floor((n - 1) * p + 1.5), 1, n)
-	return t[k]
+local function sampleWindow()
+    local samples = {}
+    local memory = gcinfo()
+    local connection = RunService.Heartbeat:Connect(function(dt) samples[#samples + 1] = dt end)
+    return function()
+        connection:Disconnect()
+        return percentile(samples, 0.95) * 1000, gcinfo() - memory
+    end
 end
 
-local function fmtBytesPerSec(bps)
-	local mb = 1024 * 1024
-	local kb = 1024
-	if bps >= mb then
-		return string.format("%.2f MB/s", bps / mb)
-	elseif bps >= kb then
-		return string.format("%.2f KB/s", bps / kb)
-	end
-	return string.format("%.0f B/s", bps)
+local function expectedState(pattern, index)
+    if pattern == "repeat" then return 1, 2, 3 end
+    if pattern == "sparse" then return 1, index, 3 end
+    return index, index * 3, index * 7
 end
 
-local function fmtMbps(bps)
-	return string.format("%.2f Mbps", (bps * 8) / 1e6)
-end
-
-local function snapBL()
-	return (_G.__BL_FLUSHES or 0), (_G.__BL_FLUSH_BYTES or 0)
-end
-
-local function snapNR()
-	return (_G.__NR_FLUSHES or 0), (_G.__NR_FLUSH_BYTES or 0)
-end
-
-local function runLoad(label, fireFn, snapFn)
-	local f0, b0 = snapFn()
-	local tStart = os.clock()
-
-	local cpu = 0
-	local steps = 0
-	local sent = 0
-
-	while (os.clock() - tStart) < CFG.durationSec do
-		local t0 = os.clock()
-		for _ = 1, CFG.firesPerStep do
-			local idx = ((sent % entityCount) + 1)
-			fireFn(Entities[idx])
-			sent += 1
-		end
-		cpu += (os.clock() - t0)
-
-		steps += 1
-		if CFG.yieldEverySteps > 0 and (steps % CFG.yieldEverySteps == 0) then
-			RunService.Heartbeat:Wait()
-		end
-	end
-
-	local elapsed = os.clock() - tStart
-	local f1, b1 = snapFn()
-
-	local flushes = f1 - f0
-	local bytes = b1 - b0
-	local bytesPerSec = elapsed > 0 and (bytes / elapsed) or 0
-	local msgsPerSec = elapsed > 0 and (sent / elapsed) or 0
-	local cpuPerMsg = sent > 0 and (cpu / sent) or 0
-
-	print(("%s Throughput: %.0f msg/s  BW: %s (%s)  CPU/msg: %.6f ms  flushes: %d")
-		:format(label, msgsPerSec, fmtBytesPerSec(bytesPerSec), fmtMbps(bytesPerSec), cpuPerMsg * 1000, flushes))
-
-	return {
-		msgsPerSec = msgsPerSec,
-		bytesPerSec = bytesPerSec,
-		cpuPerMsg = cpuPerMsg,
-	}
-end
-
-local function runFrames(label, fireFn, snapFn, amountFrames, firesPerFrame)
-	local f0, b0 = snapFn()
-	local start = os.clock()
-
-	local cpu = 0
-	local sent = 0
-
-	for _ = 1, amountFrames do
-		local t0 = os.clock()
-		for i = 1, firesPerFrame do
-			local idx = ((sent % entityCount) + 1)
-			fireFn(Entities[idx])
-			sent += 1
-		end
-		cpu += (os.clock() - t0)
-		RunService.Heartbeat:Wait()
-	end
-
-	local elapsed = os.clock() - start
-	local f1, b1 = snapFn()
-
-	local bytes = b1 - b0
-	local flushes = f1 - f0
-	local msgsPerSec = sent / elapsed
-	local bytesPerSec = bytes / elapsed
-	local cpuPerMsg = cpu / sent
-
-	print(("%s Throughput: %.0f msg/s  BW: %s (%s)  CPU/msg: %.0f ns  flushes: %d")
-		:format(label, msgsPerSec, fmtBytesPerSec(bytesPerSec), fmtMbps(bytesPerSec), cpuPerMsg * 1e9, flushes))
-
-	return { msgsPerSec = msgsPerSec, bytesPerSec = bytesPerSec, cpuPerMsg = cpuPerMsg }
-end
-
-
-local function runPing(label, callFn)
-	for _ = 1, CFG.pingWarmup do
-		pcall(function()
-			local t0 = os.clock()
-			callFn(t0)
-		end)
-		task.wait(CFG.pingGapSec)
-	end
-
-	local rtts = table.create(CFG.pingSamples)
-	for i = 1, CFG.pingSamples do
-		local t0 = os.clock()
-		local ok = pcall(function()
-			callFn(t0)
-		end)
-		rtts[i] = ok and (os.clock() - t0) or 0
-		task.wait(CFG.pingGapSec)
-	end
-
-	local a = avg(rtts)
-	local m = med(rtts)
-	local p95 = pctl(rtts, 0.95)
-	local p99 = pctl(rtts, 0.99)
-
-	print(("%s RTT: avg %.2f ms  med %.2f ms  p95 %.2f ms  p99 %.2f ms")
-		:format(label, a * 1000, m * 1000, p95 * 1000, p99 * 1000))
-end
-
-
-task.wait(2)
-
-local lp = Players.LocalPlayer
-if lp then
-	print(("Roblox Ping (GetNetworkPing): %.2f ms"):format(lp:GetNetworkPing() * 1000))
-end
-
-print("=== Latency (RTT) ===")
-runPing("Blink (Coroutine)", function(t0)
-	return BlinkPing.Invoke(t0)
+local active
+local wireConnection = Reliable.OnClientEvent:Connect(function(payload)
+    if active and typeof(payload) == "buffer" then
+        active.wireBytes += buffer.len(payload)
+        active.packets += 1
+    end
 end)
-
-runPing("NetRay (SingleSync)", function(t0)
-	return NetRayPing.Call(t0)
-end)
-
-local bl = { msgsPerSec = {}, bytesPerSec = {}, cpuPerMsg = {} }
-local nr = { msgsPerSec = {}, bytesPerSec = {}, cpuPerMsg = {} }
-
-print("=== CPU / Throughput / Bandwidth ===")
-for run = 1, CFG.runs do
-	print(("-- Run %d --"):format(run))
-
-	local blRes = runFrames("Blink", function(car) 
-		BlinkEvent.Fire(car) 
-	end, snapBL, amountFrames, firesPerFrame)
-
-
-	bl.msgsPerSec[run] = blRes.msgsPerSec
-	bl.bytesPerSec[run] = blRes.bytesPerSec
-	bl.cpuPerMsg[run] = blRes.cpuPerMsg
-
-	task.wait(1)
-
-	local nrRes = runFrames("NetRay", function(car) 
-		NetRayEvent.Fire(car) 
-	end, snapNR, amountFrames, firesPerFrame)
-
-
-	nr.msgsPerSec[run] = nrRes.msgsPerSec
-	nr.bytesPerSec[run] = nrRes.bytesPerSec
-	nr.cpuPerMsg[run] = nrRes.cpuPerMsg
-
-	task.wait(2)
+local listeners = {}
+for _, eventName in { "RawState", "RepeatState", "FieldState" } do
+    listeners[#listeners + 1] = Net[eventName].On(function(x, y, z)
+        if not active or active.eventName ~= eventName then return end
+        active.received += 1
+        local a, b, c = expectedState(active.pattern, active.received)
+        if x ~= a or y ~= b or z ~= c then active.invalid += 1 end
+    end)
 end
 
-print("=== Summary ===")
-local function dump(label, t)
-	print(label .. " msg/s   avg: " .. string.format("%.0f", avg(t.msgsPerSec)) .. "  med: " .. string.format("%.0f", med(t.msgsPerSec)))
-	print(label .. " BW avg : " .. fmtBytesPerSec(avg(t.bytesPerSec)) .. " (" .. fmtMbps(avg(t.bytesPerSec)) .. ")")
-	print(label .. " BW med : " .. fmtBytesPerSec(med(t.bytesPerSec)) .. " (" .. fmtMbps(med(t.bytesPerSec)) .. ")")
-	print(label .. " CPU/msg avg: " .. string.format("%.6f µs", avg(t.cpuPerMsg) * 1e6 ))
+local results = {}
+local function report(label, attempted, received, invalid, wireBytes, packets, enqueue, flush, elapsed, frameP95, memoryDelta)
+    local passed = received == attempted and invalid == 0
+    local row = {
+        label = label, passed = passed, attempted = attempted, received = received, invalid = invalid,
+        rawBytes = wireBytes, packets = packets, enqueueSeconds = enqueue, flushSeconds = flush,
+        elapsed = elapsed, clientFrameP95Ms = frameP95, clientLuaMemoryDeltaKB = memoryDelta,
+    }
+    results[#results + 1] = row
+    print(("[%s] %s | received %d/%d, invalid %d | %.0f delivered/s | raw %.2f B/message, %d packets | enqueue %.2f us/message, flush %.2f ms total | client frame p95 %.2f ms | client Lua delta %+.1f KB")
+        :format(passed and "PASS" or "FAIL", label, received, attempted, invalid, received / math.max(elapsed, 0.000001),
+            wireBytes / math.max(received, 1), packets, enqueue / attempted * 1e6, flush * 1000, frameP95, memoryDelta))
 end
 
-dump("Blink", bl)
-dump("NetRay", nr)
+local function runUplink(label)
+    local total = CONFIG.steps * CONFIG.perStep
+    Net.StepReplication()
+    assert(Control:InvokeServer("Begin", total))
+    local stopSamples = sampleWindow()
+    local started = os.clock()
+    local enqueue, flush, sent = 0, 0, 0
+    for _ = 1, CONFIG.steps do
+        RunService.Heartbeat:Wait()
+        local t0 = os.clock()
+        for _ = 1, CONFIG.perStep do
+            local accepted = Net.MyEvent.Fire(entities[sent % #entities + 1])
+            assert(accepted ~= false, "Benchmark message rejected by sender")
+            sent += 1
+        end
+        enqueue += os.clock() - t0
+        t0 = os.clock()
+        Net.StepReplication()
+        flush += os.clock() - t0
+    end
+    local delivery
+    local deadline = os.clock() + CONFIG.drainTimeout
+    repeat
+        delivery = Control:InvokeServer("Finish")
+        if delivery.received >= total then break end
+        task.wait(0.05)
+    until os.clock() >= deadline
+    RunService.Heartbeat:Wait()
+    delivery = Control:InvokeServer("Finish")
+    local elapsed = os.clock() - started
+    local frameP95, memory = stopSamples()
+    report(label, total, delivery.received, delivery.invalid, delivery.wireBytes, delivery.packets, enqueue, flush, elapsed, frameP95, memory)
+end
+
+local function runDownlink(label, eventName, pattern)
+    active = { eventName = eventName, pattern = pattern, received = 0, invalid = 0, wireBytes = 0, packets = 0 }
+    local stopSamples = sampleWindow()
+    local started = os.clock()
+    local metrics = Control:InvokeServer("Downstream", eventName, CONFIG.steps, CONFIG.perStep, pattern)
+    local total = CONFIG.steps * CONFIG.perStep
+    local deadline = os.clock() + CONFIG.drainTimeout
+    while active.received < total and os.clock() < deadline do task.wait(0.01) end
+    RunService.Heartbeat:Wait()
+    local elapsed = os.clock() - started
+    local frameP95, memory = stopSamples()
+    local delivery = active
+    active = nil
+    assert(metrics.sent == total, "Server did not enqueue the requested workload")
+    report(label, total, delivery.received, delivery.invalid, delivery.wireBytes, delivery.packets,
+        metrics.enqueueSeconds, metrics.flushSeconds, elapsed, frameP95, memory)
+end
+
+local function runPing()
+    local samples, failures = {}, 0
+    for index = 1, CONFIG.pingSamples + 5 do
+        local start = os.clock()
+        local ok, echoed = pcall(Net.Ping.Call, start)
+        local elapsed = os.clock() - start
+        if index > 5 then
+            if ok and echoed == start then samples[#samples + 1] = elapsed else failures += 1 end
+        end
+        task.wait(0.05)
+    end
+    print(("Ping: %d valid, %d failed | median %.2f ms, p95 %.2f ms")
+        :format(#samples, failures, percentile(samples, 0.5) * 1000, percentile(samples, 0.95) * 1000))
+end
+
+local function main()
+    task.wait(2)
+    print("NetRay benchmark: raw buffer bytes BEFORE Roblox compression; timings cover enqueue and explicit flush, not total networking CPU.")
+    print("Frame times and Lua memory are client-wide. GC can make memory deltas negative. Use one Studio client for comparable results.")
+    runPing()
+    local cases = {}
+    for _, pattern in { "repeat", "sparse", "changing" } do
+        for _, eventName in { "RawState", "RepeatState", "FieldState" } do
+            cases[#cases + 1] = {eventName, pattern}
+        end
+    end
+    for run = 1, CONFIG.runs do
+        runUplink("Uplink entities / run " .. run)
+        task.wait(0.5)
+        for index = 1, #cases do
+            local case = cases[if run % 2 == 0 then #cases - index + 1 else index]
+            runDownlink(case[1] .. " / " .. case[2] .. " / run " .. run, case[1], case[2])
+            task.wait(0.5)
+        end
+    end
+    local failed = 0
+    for _, result in results do if not result.passed then failed += 1 end end
+    print(("NetRay benchmark complete: %d cases, %d failed."):format(#results, failed))
+end
+
+local ok, failure = xpcall(main, debug.traceback)
+active = nil
+wireConnection:Disconnect()
+for _, connection in listeners do connection:Disconnect() end
+_G.NetRayBenchmarkResults = results
+local saved = ReplicatedStorage:FindFirstChild("NetRayBenchmarkResults")
+if saved then
+    assert(saved:IsA("StringValue"), "NetRayBenchmarkResults must be a StringValue")
+else
+    saved = Instance.new("StringValue")
+    saved.Name = "NetRayBenchmarkResults"
+    saved.Parent = ReplicatedStorage
+end
+saved.Value = HttpService:JSONEncode(results)
+print("Results saved on this client: ReplicatedStorage.NetRayBenchmarkResults.Value")
+if not ok then error(failure) end

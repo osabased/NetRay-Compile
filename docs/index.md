@@ -23,10 +23,16 @@ features:
   - title: End-to-End Type Safety
     details: Define your network protocol once in IDL. Get fully typed Luau code for both Client and Server instantly.
   - title: High Performance
-    details: Optimized binary serialization and intelligent batching ensure minimal bandwidth and CPU usage.
+    details: Generated buffer serializers, batching, packed booleans and optional delta compression help reduce networking overhead.
   - title: Plugin + CLI
     details: Use the same compiler core inside Roblox Studio or from a standalone CLI installed through Rokit.
 ---
+
+## v0.2.0 Update
+
+Optional reliable-event compression, opt-in traffic/work limits, faster collection codecs and saved compile inputs are now documented. Existing defaults stay unchanged; regenerate Server, Client and Types together when upgrading.
+
+[Read the update log and migration notes](/changelog#v0-2-0).
 
 ## Why NetRay?
 
@@ -34,8 +40,9 @@ NetRay Compiler bridges the gap between complex networking requirements and deve
 
 ### Key Capabilities
 - **Strict Schema Definitions**: Define events, functions, and structs in a clear, concise syntax.
-- **Automated Replication**: Changes flow automatically from your schema to your game code.
+- **Generated Modules**: Compile your schema into matching server, client and type modules.
 - **Runtime Optimization**: Built-in support for reliable/unreliable channels, segmented batching, and order preservation.
+- **Optional Policies**: Enable repeat/field-mask compression and receive limits only where your application needs them.
 - **Modern Event Modes**: `Call` supports single-handler, multi-handler, and polling receive APIs.
 
 ## Example Schema
@@ -43,13 +50,13 @@ NetRay Compiler bridges the gap between complex networking requirements and deve
 ```rust
 struct PlayerData {
     Health: u8,
-    Inventory: { u16 }
+    Inventory: array<u16>
 }
 
 event PlayerAction {
     From: Client,
     Type: Reliable,
     Call: SingleAsync,
-    Data: (Vector3, string)
+    Data: (vector<f32>, string<64>)
 }
 ```

@@ -15,7 +15,7 @@ type CompileArgs = {
 
 local function usage(): string
 	return table.concat({
-		"NetRay CLI",
+		"NetRay CLI " .. Compiler.version,
 		"",
 		"Usage:",
 		"  netray compile <schema-path> --out-dir <dir> [--scope <name>]",
@@ -24,7 +24,7 @@ local function usage(): string
 		"  <schema-path>        Path to the NetRay IDL schema file",
 		"",
 		"Options:",
-		"  --out-dir <dir>      Output directory for Server.luau, Client.luau, and Types.luau",
+		"  --out-dir <dir>      Output directory for runtime modules, Schema.idl, and CompileInfo.txt",
 		"  --scope <name>       Fallback remote scope when schema does not set option remote_scope",
 		"  -h, --help           Show this help message",
 	}, "\n")
@@ -143,20 +143,34 @@ local function compileSchema(args: CompileArgs)
 	local outputOk, outputError = pcall(function()
 		ensureOutputDir(args.outputDir)
 
-		local compiled = compiledOrError :: {
-			server: string,
-			client: string,
-			types: string,
-		}
+		local compiled = compiledOrError :: Compiler.CompileResult
 		writeOutputFile(args.outputDir, "Server.luau", compiled.server)
 		writeOutputFile(args.outputDir, "Client.luau", compiled.client)
 		writeOutputFile(args.outputDir, "Types.luau", compiled.types)
+		writeOutputFile(args.outputDir, "Schema.idl", schemaTextOrError :: string)
+		local metadata = compiled.metadata
+		local lines = {
+			"CompilerVersion = " .. metadata.compilerVersion,
+			"RemoteScope = " .. string.format("%q", metadata.remoteScope),
+			"Validate = " .. metadata.validateLevel,
+		}
+		for _, group in { { "Limit", metadata.limits }, { "Option", metadata.options } } do
+			local keys = {}
+			for key in group[2] do
+				keys[#keys + 1] = key
+			end
+			table.sort(keys)
+			for _, key in keys do
+				lines[#lines + 1] = group[1] .. "." .. key .. " = " .. string.format("%q", tostring(group[2][key]))
+			end
+		end
+		writeOutputFile(args.outputDir, "CompileInfo.txt", table.concat(lines, "\n") .. "\n")
 	end)
 	if not outputOk then
 		fail(("Failed to write output directory '%s': %s"):format(args.outputDir, cleanError(outputError)))
 	end
 
-	stdio.write(("Wrote Server.luau, Client.luau, and Types.luau to %s\n"):format(args.outputDir))
+	stdio.write(("Wrote Server.luau, Client.luau, Types.luau, Schema.idl, and CompileInfo.txt to %s\n"):format(args.outputDir))
 end
 
 local function main()

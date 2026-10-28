@@ -39,6 +39,17 @@ local expandDecodeParams = Utilities.expandDecodeParams
 local getStringBoundComment = Utilities.getStringBoundComment
 local indent = Utilities.indent
 
+local function pollingIteratorType(params: { Ast.Param }, includePlayer: boolean): string
+    local returns = { "number?" }
+    if includePlayer then
+        returns[#returns + 1] = "Player?"
+    end
+    for index = 1, #params do
+        returns[#returns + 1] = ("(%s)?"):format(toLuauType(params[index].type))
+    end
+    return ("Iter: () -> (() -> (%s)),"):format(join(returns))
+end
+
 local function emitTupleBoundsComment(lines: { string }, label: string, params: { Ast.Param })
     local bounds: { string } = {}
     for index = 1, #params do
@@ -294,7 +305,7 @@ local function generateTypes(schema: Analyzer.AnalyzedSchema): string
             end
             if clientCanReceive then
                 if usePollingApi then
-                    addLine(lines, 1, "Iter: () -> (() -> any),")
+                    addLine(lines, 1, pollingIteratorType(callbackParams, false))
                 else
                     addLine(lines, 1, ("On: (%s) -> Connection,"):format(clientCallbackTypeName))
                 end
@@ -315,7 +326,7 @@ local function generateTypes(schema: Analyzer.AnalyzedSchema): string
             end
             if serverCanReceive then
                 if usePollingApi then
-                    addLine(lines, 1, "Iter: () -> (() -> any),")
+                    addLine(lines, 1, pollingIteratorType(callbackParams, true))
                 else
                     addLine(lines, 1, ("On: (%s) -> Connection,"):format(serverCallbackTypeName))
                 end

@@ -1,103 +1,82 @@
 # Getting Started
 
-## Choose a Frontend
+NetRay Compiler v0.2.0 generates matching Server, Client and Types modules from one IDL schema. You can compile through the Studio plugin or the local CLI.
 
-NetRay Compiler currently supports two frontend workflows:
-- **Studio Plugin** for in-Studio compilation into `ReplicatedStorage`
-- **Standalone CLI** for filesystem-based generation through Rokit
+## Install
 
-## Installation
+### Studio Plugin
 
-### Option 1: Studio Plugin
+Install [NetRayCompilerPlugin](https://create.roblox.com/store/asset/100322227279356/NetRayCompilerPlugin) from the Creator Store. Open the NetRay toolbar in Studio and click **NetRayCompiler**.
 
-1. **Get the Plugin**
+### CLI
 
-   Open the [NetRay Compiler Plugin](https://create.roblox.com/store/asset/100322227279356/NetRayCompilerPlugin) on the Roblox Creator Store and click **Get**.
+Install a published CLI release through Rokit:
 
-2. **Open in Studio**
-
-   Launch Roblox Studio, open the **Plugins** tab, and look for the **NetRay** toolbar.
-
-3. **Launch Interface**
-
-   Click the **NetRayCompiler** button to open the compiler interface window.
-
-### Option 2: Standalone CLI
-
-1. **Install with Rokit**
-
-   ```sh
-   rokit add AstaWasTaken/NetRay-Compile@<version> netray
-   ```
-
-2. **Compile a schema**
-
-   ```sh
-   netray compile path/to/schema.idl --out-dir generated --scope NetRay
-   ```
-
-3. **Use the generated modules**
-
-   The CLI writes:
-   - `generated/Server.luau`
-   - `generated/Client.luau`
-   - `generated/Types.luau`
-
-## Your First Schema
-
-1. In the **Scope Name** field, enter a name for your network definition (e.g., `NetRay`). -- Can be left empty.
-2. Paste the following example into the editor:
-
-    ```rust
-    // A simple reliable event
-    event reliable Greet {
-        From: Client,
-        Data: string,
-    }
-    ```
-
-3. Click **Compile to ReplicatedStorage**.
-
-::: tip Generated Assets
-If successful, the plugin creates a folder structure in `ReplicatedStorage`:
-- `ReplicatedStorage/NetRay/Server`
-- `ReplicatedStorage/NetRay/Client`
-- `ReplicatedStorage/NetRay/Types`
-- `ReplicatedStorage/NetRay/Schema`
-:::
-
-## Understanding Scopes
-
-The **Scope Name** you enter (e.g., `Combat`) determines the names of the underlying RemoteEvents:
-- `Combat_RELIABLE`
-- `Combat_UNRELIABLE`
-- `Combat_FUNCTION`
-
-## Example Server Script
-
-```luau
--- Server
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local NetServer = require(ReplicatedStorage.NetRay.Server)
-
-NetServer.Ping.FireAll(os.clock())
-
+```sh
+rokit add AstaWasTaken/NetRay-Compile@v0.2.0 netray
+netray compile path/to/schema.idl --out-dir generated --scope NetRay
 ```
 
-## Example Client Script
+To compile from a local repository checkout instead:
+
+```sh
+rokit install
+lune run cli/netray.luau compile path/to/schema.idl --out-dir generated --scope NetRay
+```
+
+The CLI writes `Server.luau`, `Client.luau`, `Types.luau`, an exact input copy in `Schema.idl`, and `CompileInfo.txt`. Import the three Luau modules as ModuleScripts under the same folder, for example `ReplicatedStorage/NetRay`.
+
+## First Schema
+
+Paste this into the plugin's IDL editor, or save it as the CLI input file:
+
+```rust
+event Greet {
+  From: Client,
+  Type: Reliable,
+  Call: SingleSync,
+  Data: string<64>,
+}
+```
+
+No options are needed. Existing defaults remain `Validate = Off`, `DecodeStruct = Locals`, and `TypeBranding = Off`; all new rate limits, operational caps and delta compression are opt-in.
+
+In the plugin, leave the scope as `NetRay` and click **Compile to ReplicatedStorage**. It writes `Server`, `Client`, `Types`, and a non-executable schema reference named `Schema` under `ReplicatedStorage/NetRay`.
+
+## Server Script
+
+Place a Script in `ServerScriptService`:
 
 ```luau
--- Client
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local NetClient = require(ReplicatedStorage.NetRay.Client)
+local Net = require(ReplicatedStorage.NetRay.Server)
 
-NetClient.Ping.On(function(ServerClock)
-   Print("Ping: "..os.clock() - ServerClock)
+Net.Greet.On(function(player, message)
+    print(player.Name, message)
 end)
-
 ```
-## Next Steps
 
-- Learn the standalone [CLI Workflow](/cli-workflow).
-- Learn the full [IDL Syntax](/schema-reference).
-- see how to use the generated code in the [Using Generated API](/generated-api) guide.
+Requiring the server module creates the remotes.
+
+## Client Script
+
+Place a LocalScript in `StarterPlayer/StarterPlayerScripts`:
+
+```luau
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Net = require(ReplicatedStorage.NetRay.Client)
+
+Net.Greet.Fire("Hello")
+```
+
+Events automatically flush on Heartbeat. A return value of `true` means the local send/enqueue succeeded; it is not confirmation that the server handled the event.
+
+## Scopes
+
+A scope such as `Combat` names the remotes `Combat_RELIABLE`, `Combat_UNRELIABLE`, and `Combat_FUNCTION`. The schema's `option remote_scope = "Combat";` takes precedence over the CLI/plugin scope field. It does not change the plugin's output folder.
+
+## Updating an Existing Game
+
+Regenerate and replace Server, Client and Types as a matching set. v0.2.0 changes some binary encodings and polling iterator arguments. Existing schemas do not need new limits added. See the [v0.2.0 migration notes](/changelog#v0-2-0).
+
+Continue with the [schema reference](/schema-reference), [generated API](/generated-api), [options](/options), or [CLI workflow](/cli-workflow).

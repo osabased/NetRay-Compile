@@ -105,8 +105,14 @@ local function parse(tokens: { Token }): Ast.Schema
     end
 
     local function expectNumber(): number
+        local negative = accept("symbol", "-") ~= nil
         local token = expect("number", nil)
-        local parsed = tonumber(token.value)
+        local text = token.value
+        if tokens[index] and tokens[index].value == "." and tokens[index + 1] and tokens[index + 1].kind == "number" then
+            index += 1
+            text ..= "." .. expect("number", nil).value
+        end
+        local parsed = tonumber((negative and "-" or "") .. text)
         if parsed == nil then
             fail("Expected numeric literal", token)
         end
@@ -119,7 +125,10 @@ local function parse(tokens: { Token }): Ast.Schema
             fail("Unexpected end of tokens while parsing option value", token)
         end
 
-        if token.kind == "string" or token.kind == "identifier" or token.kind == "keyword" or token.kind == "number" then
+        if token.kind == "number" or (token.kind == "symbol" and token.value == "-") then
+            return tostring(expectNumber())
+        end
+        if token.kind == "string" or token.kind == "identifier" or token.kind == "keyword" then
             index += 1
             return token.value
         end
@@ -669,11 +678,18 @@ local function parse(tokens: { Token }): Ast.Schema
         local direction = "both"
         local reliability = defaultReliability
         local callMode = "ManySync"
+        local compression: string? = nil
         local params: { Ast.Param } = {}
+        local limits: { [string]: number } = {}
+        local keys: { [string]: boolean } = {}
 
         expect("symbol", "{")
         while not accept("symbol", "}") do
             local key = string.lower(expectIdentifierLike())
+            if keys[key] then
+                error(("Duplicate event property '%s'"):format(key))
+            end
+            keys[key] = true
             expect("symbol", ":")
             if key == "from" then
                 direction = normalizeEventFrom(expectIdentifierLike())
@@ -681,8 +697,16 @@ local function parse(tokens: { Token }): Ast.Schema
                 reliability = normalizeReliability(expectIdentifierLike())
             elseif key == "call" then
                 callMode = normalizeEventCall(expectIdentifierLike())
+            elseif key == "compression" then
+                local mode = string.lower(expectIdentifierLike())
+                if mode ~= "repeat" and mode ~= "fields" then
+                    error("Event compression must be Repeat or Fields")
+                end
+                compression = mode == "repeat" and "Repeat" or "Fields"
             elseif key == "data" then
                 params = parseDataParams("data", "v")
+            elseif key == "rate" or key == "burst" or key == "max" then
+                limits[key] = expectNumber()
             else
                 error("E_EVENT_KEY")
             end
@@ -695,6 +719,10 @@ local function parse(tokens: { Token }): Ast.Schema
             reliability = reliability,
             from = direction,
             call = callMode,
+            compression = compression,
+            rate = limits.rate,
+            burst = limits.burst,
+            max = limits.max,
         }
     end
 

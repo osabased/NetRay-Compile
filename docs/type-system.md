@@ -6,7 +6,7 @@ NetRay supports standard primitive types for efficient binary serialization.
 - **Boolean:** `bool` / `boolean`
 - **Integer (Unsigned):** `u8`, `u16`, `u32`
 - **Integer (Signed):** `i8`, `i16`, `i32`
-- **Float:** `f16` (New), `f32`, `f64`
+- **Float:** `f16`, `f32`, `f64`
 - **String:** `string`
 - **Buffer:** `buffer`
 - **Roblox Types:**
@@ -40,13 +40,14 @@ When validation is enabled (`Validate` option), integers are checked against the
 | `i32` | `-2,147,483,648` to `2,147,483,647` |
 
 **Notes:**
-- `f32` and `f64` are not range-checked (standard IEEE 754 behavior).
-- `bool` utilizes a single byte tag.
+- Bare floating-point types use IEEE 754 values. Declared numeric ranges are checked; a bounded float rejects NaN.
+- `f16` rounds to the nearest representable half-precision value with ties to even and preserves signed zero.
+- A standalone `bool` uses one byte. Boolean arrays, fixed arrays and sets are bit-packed.
 
 ## String Bounds
 Strings can be bounded or unbounded.
 
-- `string`: Unbounded (up to 4GB).
+- `string`: No declared maximum; the length prefix can represent up to 4,294,967,295 bytes. Actual buffer and transport limits still apply.
 - `string<64>`: Max 64 bytes.
 - `string(64)`: Alternative syntax for Max 64 bytes.
 - `string(8, 64)`: Alternative syntax with min/max bounds.
@@ -54,6 +55,12 @@ Strings can be bounded or unbounded.
 ::: warning Size Limit
 Declared max length must be `<= 65535`. Without a declared max, the runtime uses varint length prefixes which support up to `4,294,967,295` bytes.
 :::
+
+## Length Encoding
+
+Bounded strings, buffers, arrays and maps use a fixed-width count based on the allowed range. For `string(300, 310)`, the count stores `length - 300`, so one byte is enough. An exact bound such as `string(8, 8)` needs no length prefix. Unbounded lengths use a variable-width integer.
+
+These rules are part of the wire format. Changing bounds or upgrading from an older encoding requires regenerating both runtime modules together.
 
 ## Container Types
 
@@ -76,6 +83,9 @@ array<Pose, 50>
 - **Dynamic length list.**
 - Optional max bound (2nd arg).
 - Without declared max, uses varint count prefix.
+- Arrays are limited to 65,535 elements, including without a declared max.
+  Senders enforce this limit before encoding. Receivers check the count and
+  minimum required payload bytes before allocating, even with validation `Off`.
 - **Optimization:** Boolean arrays are bit-packed.
 
 ### FixedArray
@@ -97,7 +107,7 @@ map<u16, Pose, 128>
 ```
 - Key-Value store.
 - Optional max entry bound (3rd arg).
-- **Note:** Iteration order is undefined (Lua `next` behavior). Do not rely on wire order.
+- The encoder canonicalizes supported map keys for a stable serialized representation. Application iteration order is not part of the API contract.
 
 
 ## Set
@@ -175,5 +185,5 @@ Configure via `option Validate = ...;`
 - **`Full`**: Strict shape and type checking for all values.
 
 ::: tip Recommendation
-Use **`Full`** during development to catch bugs early. Switch to `Basic` or `Off` in production if profiling shows bottlenecks. `Off` is the default and recommended as it allows for maximum performance.
+`Off` remains the default. Use `Full` to catch invalid caller values while building your game, then choose a mode based on your application's validation needs and profiling. Buffer bounds, decoding tags and array allocation checks remain active in every mode. Validation modes do not replace gameplay authorization or optional traffic limits.
 :::

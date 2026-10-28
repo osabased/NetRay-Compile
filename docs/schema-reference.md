@@ -1,5 +1,9 @@
 # Schema Reference
 
+Message and scope names must be unique within their scope. Root API names
+`StepReplication` and `Stats` are reserved. Parameter names must be unique within
+each parameter list and cannot be reserved Luau words such as `end`.
+
 ## File-Level Declarations
 Top-level declarations in an IDL file:
 - `option` - Configure compiler behavior.
@@ -25,7 +29,7 @@ option Validate = Full;
 option DecodeStruct = Table;
 ```
 
-Option values may be strings, identifiers/keywords, or numbers.
+Option values may be strings, identifiers/keywords, or numbers. Options are optional; see [defaults and supported limits](/options). Option names and event property keys are case-insensitive. Duplicate options or event properties are rejected.
 
 ## Scopes
 Scopes namespace messages and can nest arbitrarily.
@@ -51,7 +55,7 @@ Generated path: `Net.Gameplay.Vehicles.Spawned`
 Generated APIs start at `Net`.
 
 ```luau
-Net.Gameplay.Vehicles.Spawned
+local Spawned = Net.Gameplay.Vehicles.Spawned
 ```
 
 ### Global Type Names
@@ -143,6 +147,10 @@ event Position {
 | `Type` | `Reliable`, `Unreliable` | `Reliable` | Delivery channel. |
 | `Call` | `SingleSync`, `ManySync`, `SingleAsync`, `ManyAsync`, `Polling` | `ManySync` | Receive-side handler model. |
 | `Data` | Type or Tuple | - | Event payload. |
+| `Compression` | `Repeat`, `Fields` | Omitted (off) | Delta compression for reliable events only. |
+| `Rate` | Positive number | Omitted (unlimited) | Accepted events per second, per player on the server. |
+| `Burst` | Positive integer | `ceil(Rate)` when Rate is set | Token capacity; requires Rate. |
+| `Max` | Positive integer | Omitted (unlimited) | Maximum serialized event body bytes before delta compression, excluding event ID and mode/header bytes. |
 
 `Call` behavior in current generator:
 - `SingleSync` / `SingleAsync`: single active `On` handler.
@@ -152,6 +160,24 @@ event Position {
 ::: danger Unknown Keys
 Unknown block keys trigger `E_EVENT_KEY`.
 :::
+
+### Optional Event Policies
+
+`Rate` is allowed only for `From: Client` or `Both`; it affects server receiving, not server sending. It refills continuously per second, rather than resetting a counter on each whole-second boundary. Omit `Rate` and `Burst` to disable rate limiting.
+
+`Max` applies to the encoded body, not the number of characters in a string or all Roblox transport bytes. String/collection prefixes count toward it; passthrough arguments are outside the buffer. Oversized local sends return `false`; incoming violations are rejected. Not every rejection produces a warning.
+
+```rust
+event ChatInput {
+  From: Client,
+  Rate: 2,
+  Burst: 4,
+  Max: 256,
+  Data: string<200>,
+}
+```
+
+Compression does not accept passthrough or instance references, including nested references. `Fields` requires supported fixed-width top-level arguments. See [runtime compression](/runtime-model#optional-delta-compression) for layout restrictions, baseline lifetime and CPU costs. `Compression: Off` is not valid; omit the property to turn it off.
 
 ### Legacy Syntax
 

@@ -56,7 +56,8 @@ trap cleanup EXIT
 tail -n +"\${PAYLOAD_LINE}" "\${SELF}" | decode_base64 > "\${WORKDIR}/payload.tar.gz"
 tar -xzf "\${WORKDIR}/payload.tar.gz" -C "\${WORKDIR}"
 chmod +x "\${WORKDIR}/lune"
-exec "\${WORKDIR}/lune" run "\${WORKDIR}/cli/netray.luau" "\$@"
+"\${WORKDIR}/lune" run "\${WORKDIR}/cli/netray.luau" "\$@"
+exit \$?
 __NETRAY_PAYLOAD_BELOW__
 ${BASE64_PAYLOAD}
 EOF

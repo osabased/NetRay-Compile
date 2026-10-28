@@ -51,6 +51,40 @@ local toLuauType = Utilities.toLuauType
 
 local DEFAULT_F32_TYPE: Ast.Type = { kind = "f32" }
 
+local function minimumElementBytes(typeDef: Ast.Type, structByName: { [string]: Ast.Struct }): number
+    local fixedBytes = computeFixedByteSize(typeDef, structByName, {})
+    if fixedBytes ~= nil then return fixedBytes end
+    if typeDef.kind == "fixedarray" then
+        return getFixedArrayLength(typeDef) * minimumElementBytes(typeDef.value, structByName)
+    end
+    local structDecl = structByName[typeDef.kind]
+    local fields = if typeDef.kind == "inline_struct" then typeDef.fields elseif structDecl then structDecl.fields else nil
+    if fields then
+        local total = 0
+        for index = 1, #fields do
+            total += minimumElementBytes(fields[index].type, structByName)
+        end
+        return total
+    end
+    return 1
+end
+
+local function emitArrayAllocationCheck(
+    lines: { string }, depth: number, typeDef: Ast.Type, valueType: Ast.Type,
+    countVar: string, offsetVar: string, payloadLengthVar: string,
+    structByName: { [string]: Ast.Struct }
+)
+    -- Check before table.create, including when validation is Off.
+    local maxCount = typeDef.max or 65535
+    local elementBytes = minimumElementBytes(valueType, structByName)
+    local requiredBytes = if normalizeTypeKind(valueType.kind) == "bool"
+        then ("((%s + 7) // 8)"):format(countVar)
+        else ("%s * %d"):format(countVar, elementBytes)
+    addLine(lines, depth, ("if %s > %d or %s > %s - %s then error(ERR_BOUNDS) end"):format(
+        countVar, maxCount, requiredBytes, payloadLengthVar, offsetVar
+    ))
+end
+
 local function getEnumValues(typeDef: Ast.Type): { string }
     local values = (typeDef.values :: any) :: { string }?
     if values == nil or #values == 0 then
@@ -107,6 +141,97 @@ local function getCFrameComponentTypes(typeDef: Ast.Type): (Ast.Type, Ast.Type)
     return posType, rotType
 end
 
+local function emitNumericBounds(lines, depth, typeDef, valueExpr, label, validateLevel)
+    if typeDef.min ~= nil then
+        addLine(lines, depth, ("if not (%s >= %s) then"):format(valueExpr, tostring(typeDef.min)))
+        emitError(lines, depth + 1, validateLevel, label .. " below minimum or NaN", "ERR_SCHEMA")
+        addLine(lines, depth, "end")
+    end
+    if typeDef.max ~= nil then
+        addLine(lines, depth, ("if not (%s <= %s) then"):format(valueExpr, tostring(typeDef.max)))
+        emitError(lines, depth + 1, validateLevel, label .. " above maximum or NaN", "ERR_SCHEMA")
+        addLine(lines, depth, "end")
+    end
+end
+
+local function uncheckedElementSize(typeDef, validateLevel, structByName): number?
+    if isValidateFull(validateLevel) then return nil end
+    local size = computeFixedByteSize(typeDef, structByName, {})
+    if size == nil then return nil end
+    if isValidateBasicOrFull(validateLevel) and (typeDef.min ~= nil or typeDef.max ~= nil) then return nil end
+    if typeDef.kind == "fixedarray" then return nil end
+    local structDecl = structByName[typeDef.kind]
+    if structDecl then
+        for _, field in structDecl.fields do
+            if uncheckedElementSize(field.type, validateLevel, structByName) == nil then return nil end
+        end
+    end
+    return size
+end
+
+local function emitFixedLengthWrite(
+    lines: { string }, depth: number, widthInfo: WidthInfo, typeDef: Ast.Type,
+    bufferVar: string, offsetVar: string, lengthExpr: string
+)
+    if widthInfo.bytes == 0 then return end
+    local encodedLength = if typeDef.min ~= nil and typeDef.min ~= 0
+        then ("(%s - %d)"):format(lengthExpr, typeDef.min) else lengthExpr
+    addLine(lines, depth, ("%s(%s, %s, %s)"):format(widthInfo.writer, bufferVar, offsetVar, encodedLength))
+end
+
+local function emitFixedLengthRead(
+    lines: { string }, state: EmitState, depth: number, widthInfo: WidthInfo, typeDef: Ast.Type,
+    targetVar: string, payloadVar: string, payloadLengthVar: string, offsetVar: string
+)
+    local minimum = typeDef.min or 0
+    if widthInfo.bytes == 0 then
+        addLine(lines, depth, ("local %s = %d"):format(targetVar, minimum))
+        return
+    end
+    local nextOffset = nextTemp(state, "lengthNext")
+    addLine(lines, depth, ("local %s = %s + %d"):format(nextOffset, offsetVar, widthInfo.bytes))
+    addLine(lines, depth, ("if %s > %s then error(ERR_BOUNDS) end"):format(nextOffset, payloadLengthVar))
+    local lengthExpr = ("%s(%s, %s)"):format(widthInfo.reader, payloadVar, offsetVar)
+    if minimum ~= 0 then lengthExpr ..= (" + %d"):format(minimum) end
+    addLine(lines, depth, ("local %s = %s"):format(targetVar, lengthExpr))
+    addLine(lines, depth, ("%s = %s"):format(offsetVar, nextOffset))
+end
+
+local function hasCollection(typeDef: Ast.Type, structByName: { [string]: Ast.Struct }): boolean
+    local kind = normalizeTypeKind(typeDef.kind)
+    if kind == "array" or kind == "fixedarray" or kind == "map" then return true end
+    if kind == "optional" then return hasCollection(typeDef.value, structByName) end
+    if kind == "tagged_enum" then
+        for _, variant in typeDef.variants or {} do
+            for _, field in variant.fields or {} do
+                if hasCollection(field.type, structByName) then return true end
+            end
+        end
+    end
+    local structDecl = structByName[kind]
+    local fields = if kind == "inline_struct" then typeDef.fields elseif structDecl then structDecl.fields else nil
+    if fields ~= nil then
+        for _, field in fields do
+            if hasCollection(field.type, structByName) then return true end
+        end
+    end
+    return false
+end
+
+local function emitDecodeBudget(lines: { string }, params: { Ast.Param }, structByName: { [string]: Ast.Struct })
+    for _, param in params do
+        if hasCollection(param.type, structByName) then
+            addLine(lines, 1, "decodeBudget = decodeBudget or { remaining = MaxDecodeWork }")
+            return
+        end
+    end
+end
+
+local function emitDecodeWork(lines, depth, count)
+    addLine(lines, depth, ("decodeBudget.remaining -= %s"):format(count))
+    addLine(lines, depth, "if decodeBudget.remaining < 0 then error(ERR_BOUNDS) end")
+end
+
 local function emitSizeForType(
     lines: { string },
     state: EmitState,
@@ -140,12 +265,12 @@ local function emitSizeForType(
             local minBound = typeDef.min
             local maxBound = typeDef.max
             if minBound ~= nil then
-                addLine(lines, depth, ("if %s < %s then"):format(valueExpr, tostring(minBound)))
+                addLine(lines, depth, ("if not (%s >= %s) then"):format(valueExpr, tostring(minBound)))
                 emitError(lines, depth + 1, validateLevel, label .. " below minimum", "ERR_SCHEMA")
                 addLine(lines, depth, "end")
             end
             if maxBound ~= nil then
-                addLine(lines, depth, ("if %s > %s then"):format(valueExpr, tostring(maxBound)))
+                addLine(lines, depth, ("if not (%s <= %s) then"):format(valueExpr, tostring(maxBound)))
                 emitError(lines, depth + 1, validateLevel, label .. " above maximum", "ERR_SCHEMA")
                 addLine(lines, depth, "end")
             end
@@ -177,12 +302,12 @@ local function emitSizeForType(
         end
         addLine(lines, depth, ("local %s = #%s"):format(lenVar, valueExpr))
         cacheCollectionHint(stringLenHints, depth, "string", valueExpr, lenVar)
-        if isValidateBasicOrFull(validateLevel) and declaredMin ~= nil then
+        if declaredMin ~= nil then
             addLine(lines, depth, ("if %s < %d then"):format(lenVar, declaredMin))
             emitError(lines, depth + 1, validateLevel, label .. " below minimum length", "ERR_SCHEMA")
             addLine(lines, depth, "end")
         end
-        if isValidateBasicOrFull(validateLevel) and declaredMax ~= nil then
+        if declaredMax ~= nil then
             addLine(lines, depth, ("if %s > %d then"):format(lenVar, declaredMax))
             emitError(lines, depth + 1, validateLevel, label .. " exceeds max length", "ERR_SCHEMA")
             addLine(lines, depth, "end")
@@ -213,12 +338,12 @@ local function emitSizeForType(
         end
         addLine(lines, depth, ("local %s = len(%s)"):format(lenVar, valueExpr))
         cacheCollectionHint(stringLenHints, depth, "buffer", valueExpr, lenVar)
-        if isValidateBasicOrFull(validateLevel) and declaredMin ~= nil then
+        if declaredMin ~= nil then
             addLine(lines, depth, ("if %s < %d then"):format(lenVar, declaredMin))
             emitError(lines, depth + 1, validateLevel, label .. " below minimum length", "ERR_SCHEMA")
             addLine(lines, depth, "end")
         end
-        if isValidateBasicOrFull(validateLevel) and declaredMax ~= nil then
+        if declaredMax ~= nil then
             addLine(lines, depth, ("if %s > %d then"):format(lenVar, declaredMax))
             emitError(lines, depth + 1, validateLevel, label .. " exceeds max length", "ERR_SCHEMA")
             addLine(lines, depth, "end")
@@ -252,16 +377,21 @@ local function emitSizeForType(
             addLine(lines, depth, "end")
         end
         addLine(lines, depth, ("local %s = %s"):format(vectorVar, valueExpr))
+        if isValidateBasicOrFull(validateLevel) then
+            for _, component in { "X", "Y", "Z" } do
+                emitNumericBounds(lines, depth, componentType, vectorVar .. "." .. component, label, validateLevel)
+            end
+        end
         if isValidateBasicOrFull(validateLevel) and (minBound ~= nil or maxBound ~= nil) then
             local magnitudeVar = nextTemp(state, "vectorMagnitude")
             addLine(lines, depth, ("local %s = %s.Magnitude"):format(magnitudeVar, vectorVar))
             if minBound ~= nil then
-                addLine(lines, depth, ("if %s < %s then"):format(magnitudeVar, tostring(minBound)))
+                addLine(lines, depth, ("if not (%s >= %s) then"):format(magnitudeVar, tostring(minBound)))
                 emitError(lines, depth + 1, validateLevel, label .. " magnitude below minimum", "ERR_SCHEMA")
                 addLine(lines, depth, "end")
             end
             if maxBound ~= nil then
-                addLine(lines, depth, ("if %s > %s then"):format(magnitudeVar, tostring(maxBound)))
+                addLine(lines, depth, ("if not (%s <= %s) then"):format(magnitudeVar, tostring(maxBound)))
                 emitError(lines, depth + 1, validateLevel, label .. " magnitude above maximum", "ERR_SCHEMA")
                 addLine(lines, depth, "end")
             end
@@ -283,6 +413,18 @@ local function emitSizeForType(
             addLine(lines, depth, ("if typeof(%s) ~= \"CFrame\" then"):format(valueExpr))
             emitError(lines, depth + 1, validateLevel, label .. " must be CFrame", "ERR_TYPE")
             addLine(lines, depth, "end")
+        end
+        if isValidateBasicOrFull(validateLevel) then
+            for _, component in { "X", "Y", "Z" } do
+                emitNumericBounds(lines, depth, posType, valueExpr .. ".Position." .. component, label, validateLevel)
+            end
+            if rotType.min ~= nil or rotType.max ~= nil then
+                local rx, ry, rz = nextTemp(state, "rotationX"), nextTemp(state, "rotationY"), nextTemp(state, "rotationZ")
+                addLine(lines, depth, ("local %s, %s, %s = %s:ToOrientation()"):format(rx, ry, rz, valueExpr))
+                for _, component in { rx, ry, rz } do
+                    emitNumericBounds(lines, depth, rotType, component, label, validateLevel)
+                end
+            end
         end
         addLine(lines, depth, ("%s += %d"):format(sizeVar, posBytes * 3 + rotBytes * 3))
         return
@@ -462,15 +604,18 @@ local function emitSizeForType(
         end
         addLine(lines, depth, ("local %s = #%s"):format(lenVar, valueExpr))
         cacheCollectionHint(stringLenHints, depth, "array", valueExpr, lenVar)
+        if not isFixedArray then
+            addLine(lines, depth, ("if %s > %d then error(ERR_SCHEMA) end"):format(lenVar, declaredMax or 65535))
+        end
         if fixedLength ~= nil then
             addLine(lines, depth, ("if %s ~= %d then"):format(lenVar, fixedLength))
             emitError(lines, depth + 1, validateLevel, label .. " has invalid fixedarray length", "ERR_SCHEMA")
             addLine(lines, depth, "end")
-        elseif isValidateBasicOrFull(validateLevel) and declaredMin ~= nil then
+        elseif declaredMin ~= nil then
             addLine(lines, depth, ("if %s < %d then"):format(lenVar, declaredMin))
             emitError(lines, depth + 1, validateLevel, label .. " below minimum array length", "ERR_SCHEMA")
             addLine(lines, depth, "end")
-        elseif isValidateBasicOrFull(validateLevel) and declaredMax ~= nil then
+        elseif declaredMax ~= nil then
             addLine(lines, depth, ("if %s > %d then"):format(lenVar, declaredMax))
             emitError(lines, depth + 1, validateLevel, label .. " exceeds array bound", "ERR_SCHEMA")
             addLine(lines, depth, "end")
@@ -527,6 +672,9 @@ local function emitSizeForType(
                 addLine(lines, depth, "end")
             end
             addLine(lines, depth, ("%s += ((%s + 7) // 8)"):format(sizeVar, lenVar))
+        elseif uncheckedElementSize(valueType, validateLevel, structByName) ~= nil then
+            local elementSize = uncheckedElementSize(valueType, validateLevel, structByName)
+            addLine(lines, depth, ("%s += %s * %d"):format(sizeVar, lenVar, elementSize))
         else
             addLine(lines, depth, ("for %s = 1, %s do"):format(indexVar, lenVar))
             emitSizeForType(
@@ -569,7 +717,7 @@ local function emitSizeForType(
         addLine(lines, depth, ("local %s, %s = next(%s, nil)"):format(mapKey, mapValue, valueExpr))
         addLine(lines, depth, ("while %s ~= nil do"):format(mapKey))
         addLine(lines, depth + 1, ("%s += 1"):format(mapCount))
-        if isValidateBasicOrFull(validateLevel) and declaredMax ~= nil then
+        if declaredMax ~= nil then
             addLine(lines, depth + 1, ("if %s > %d then"):format(mapCount, declaredMax))
             emitError(lines, depth + 2, validateLevel, label .. " exceeds map bound", "ERR_SCHEMA")
             addLine(lines, depth + 1, "end")
@@ -578,7 +726,7 @@ local function emitSizeForType(
         emitSizeForType(lines, state, valueType, mapValue, label .. " value", sizeVar, depth + 1, validateLevel, structByName, stringLenHints)
         addLine(lines, depth + 1, ("%s, %s = next(%s, %s)"):format(mapKey, mapValue, valueExpr, mapKey))
         addLine(lines, depth, "end")
-        if isValidateBasicOrFull(validateLevel) and declaredMin ~= nil then
+        if declaredMin ~= nil then
             addLine(lines, depth, ("if %s < %d then"):format(mapCount, declaredMin))
             emitError(lines, depth + 1, validateLevel, label .. " below minimum map size", "ERR_SCHEMA")
             addLine(lines, depth, "end")
@@ -622,6 +770,57 @@ local function emitSizeForType(
     end
 
     error(("Unsupported serialized type '%s' in %s"):format(kind, label))
+end
+
+local function emitWriteBoolArray(lines, state, values, count, payload, offset, depth)
+    local index = nextTemp(state, "boolIndex")
+    local packed = nextTemp(state, "boolByte")
+    local mask = nextTemp(state, "boolMask")
+    addLine(lines, depth, ("local %s = 1"):format(index))
+    addLine(lines, depth, ("for _ = 1, %s // 8 do"):format(count))
+    local terms = {}
+    for bit = 0, 7 do
+        terms[#terms + 1] = ("(if %s[%s] then %d else 0)"):format(values, offsetExpr(index, bit), 2 ^ bit)
+    end
+    addLine(lines, depth + 1, ("writeu8(%s, %s,"):format(payload, offset))
+    for bit, term in terms do
+        addLine(lines, depth + 2, term .. (bit < #terms and " +" or ""))
+    end
+    addLine(lines, depth + 1, ")")
+    addLine(lines, depth + 1, ("%s += 8"):format(index))
+    addLine(lines, depth + 1, ("%s += 1"):format(offset))
+    addLine(lines, depth, "end")
+    addLine(lines, depth, ("if %s <= %s then"):format(index, count))
+    addLine(lines, depth + 1, ("local %s, %s = 0, 1"):format(packed, mask))
+    addLine(lines, depth + 1, ("for %s = %s, %s do"):format(index, index, count))
+    addLine(lines, depth + 2, ("if %s[%s] then %s += %s end"):format(values, index, packed, mask))
+    addLine(lines, depth + 2, ("%s *= 2"):format(mask))
+    addLine(lines, depth + 1, "end")
+    addLine(lines, depth + 1, ("writeu8(%s, %s, %s)"):format(payload, offset, packed))
+    addLine(lines, depth + 1, ("%s += 1"):format(offset))
+    addLine(lines, depth, "end")
+end
+
+local function emitReadBoolArray(lines, state, payload, offset, values, count, depth)
+    local index = nextTemp(state, "boolIndex")
+    local packed = nextTemp(state, "boolByte")
+    addLine(lines, depth, ("local %s = 1"):format(index))
+    addLine(lines, depth, ("for _ = 1, %s // 8 do"):format(count))
+    addLine(lines, depth + 1, ("local %s = readu8(%s, %s)"):format(packed, payload, offset))
+    for bit = 0, 7 do
+        addLine(lines, depth + 1, ("%s[%s] = band(%s, %d) ~= 0"):format(values, offsetExpr(index, bit), packed, 2 ^ bit))
+    end
+    addLine(lines, depth + 1, ("%s += 8"):format(index))
+    addLine(lines, depth + 1, ("%s += 1"):format(offset))
+    addLine(lines, depth, "end")
+    addLine(lines, depth, ("if %s <= %s then"):format(index, count))
+    addLine(lines, depth + 1, ("local %s = readu8(%s, %s)"):format(packed, payload, offset))
+    addLine(lines, depth + 1, ("for %s = %s, %s do"):format(index, index, count))
+    addLine(lines, depth + 2, ("%s[%s] = band(%s, 1) ~= 0"):format(values, index, packed))
+    addLine(lines, depth + 2, ("%s = rshift(%s, 1)"):format(packed, packed))
+    addLine(lines, depth + 1, "end")
+    addLine(lines, depth + 1, ("%s += 1"):format(offset))
+    addLine(lines, depth, "end")
 end
 
 local function emitWriteForType(
@@ -668,9 +867,9 @@ local function emitWriteForType(
             addLine(lines, depth, ("%s += %s"):format(offsetVar, lenExpr))
         elseif widthInfo ~= nil then
             local stringBase = nextTemp(state, "stringBase")
-            local stringDataOffset = ("%s + %d"):format(stringBase, widthInfo.bytes)
+            local stringDataOffset = if widthInfo.bytes == 0 then stringBase else ("%s + %d"):format(stringBase, widthInfo.bytes)
             addLine(lines, depth, ("local %s = %s"):format(stringBase, offsetVar))
-            addLine(lines, depth, ("%s(%s, %s, %s)"):format(widthInfo.writer, bufferVar, stringBase, lenExpr))
+            emitFixedLengthWrite(lines, depth, widthInfo, typeDef, bufferVar, stringBase, lenExpr)
             addLine(lines, depth, ("writestring(%s, %s, %s)"):format(bufferVar, stringDataOffset, valueExpr))
             addLine(lines, depth, ("%s = %s + %s"):format(offsetVar, stringDataOffset, lenExpr))
         else
@@ -694,7 +893,7 @@ local function emitWriteForType(
         if prefixInfo.isVarint then
             addLine(lines, depth, ("%s = WriteVarUInt(%s, %s, %s)"):format(offsetVar, bufferVar, offsetVar, lenExpr))
         elseif widthInfo ~= nil then
-            addLine(lines, depth, ("%s(%s, %s, %s)"):format(widthInfo.writer, bufferVar, offsetVar, lenExpr))
+            emitFixedLengthWrite(lines, depth, widthInfo, typeDef, bufferVar, offsetVar, lenExpr)
             addLine(lines, depth, ("%s += %d"):format(offsetVar, widthInfo.bytes))
         else
             error("Internal buffer length prefix mismatch")
@@ -944,43 +1143,15 @@ local function emitWriteForType(
             elseif prefixInfo.isVarint then
                 addLine(lines, depth, ("%s = WriteVarUInt(%s, %s, %s)"):format(offsetVar, bufferVar, offsetVar, lenExpr))
             elseif widthInfo ~= nil then
-                addLine(lines, depth, ("%s(%s, %s, %s)"):format(widthInfo.writer, bufferVar, offsetVar, lenExpr))
+                emitFixedLengthWrite(lines, depth, widthInfo, typeDef, bufferVar, offsetVar, lenExpr)
                 addLine(lines, depth, ("%s += %d"):format(offsetVar, widthInfo.bytes))
             else
                 error("Internal array length prefix mismatch")
             end
         end
         if valueKind == "bool" then
-            local packedByteCount = nextTemp(state, "arrayPackedByteCount")
-            local packedIndex = nextTemp(state, "arrayPackedIndex")
-            local valueIndex = nextTemp(state, "arrayValueIndex")
-            local bitIndex = nextTemp(state, "arrayBitIndex")
-            local bitMask = nextTemp(state, "arrayBitMask")
-            local packedByte = nextTemp(state, "arrayPackedByte")
-            if fixedLength ~= nil then
-                local constantPackedBytes = ((fixedLength + 7) // 8)
-                addLine(lines, depth, ("local %s = %d"):format(packedByteCount, constantPackedBytes))
-            else
-                addLine(lines, depth, ("local %s = ((%s + 7) // 8)"):format(packedByteCount, lenExpr))
-            end
-            addLine(lines, depth, ("local %s = 1"):format(valueIndex))
-            addLine(lines, depth, ("for %s = 1, %s do"):format(packedIndex, packedByteCount))
-            addLine(lines, depth + 1, ("local %s = 0"):format(packedByte))
-            addLine(lines, depth + 1, ("local %s = 1"):format(bitMask))
-            addLine(lines, depth + 1, ("for %s = 1, 8 do"):format(bitIndex))
             local loopBoundExpr = if fixedLength ~= nil then tostring(fixedLength) else lenExpr
-            addLine(lines, depth + 2, ("if %s > %s then"):format(valueIndex, loopBoundExpr))
-            addLine(lines, depth + 3, "break")
-            addLine(lines, depth + 2, "end")
-            addLine(lines, depth + 2, ("if %s[%s] then"):format(valueExpr, valueIndex))
-            addLine(lines, depth + 3, ("%s = bor(%s, %s)"):format(packedByte, packedByte, bitMask))
-            addLine(lines, depth + 2, "end")
-            addLine(lines, depth + 2, ("%s += 1"):format(valueIndex))
-            addLine(lines, depth + 2, ("%s = lshift(%s, 1)"):format(bitMask, bitMask))
-            addLine(lines, depth + 1, "end")
-            addLine(lines, depth + 1, ("writeu8(%s, %s, %s)"):format(bufferVar, offsetVar, packedByte))
-            addLine(lines, depth + 1, ("%s += 1"):format(offsetVar))
-            addLine(lines, depth, "end")
+            emitWriteBoolArray(lines, state, valueExpr, loopBoundExpr, bufferVar, offsetVar, depth)
         else
             local loopBoundExpr = if fixedLength ~= nil then tostring(fixedLength) else lenExpr
             addLine(lines, depth, ("for %s = 1, %s do"):format(indexVar, loopBoundExpr))
@@ -1028,7 +1199,7 @@ local function emitWriteForType(
         if prefixInfo.isVarint then
             addLine(lines, depth, ("%s = WriteVarUInt(%s, %s, %s)"):format(offsetVar, bufferVar, offsetVar, countExpr))
         elseif widthInfo ~= nil then
-            addLine(lines, depth, ("%s(%s, %s, %s)"):format(widthInfo.writer, bufferVar, offsetVar, countExpr))
+            emitFixedLengthWrite(lines, depth, widthInfo, typeDef, bufferVar, offsetVar, countExpr)
             addLine(lines, depth, ("%s += %d"):format(offsetVar, widthInfo.bytes))
         else
             error("Internal map length prefix mismatch")
@@ -1124,6 +1295,7 @@ local function emitReadFixedFromBlock(
     local reader = PRIMITIVE_READERS[kind]
     if reader ~= nil then
         addLine(lines, depth, ("%s = (%s(%s, %s) :: %s)"):format(targetVar, reader, payloadVar, readOffset, toLuauType(typeDef)))
+        emitNumericBounds(lines, depth, typeDef, targetVar, label, validateLevel)
         return
     end
 
@@ -1147,32 +1319,13 @@ local function emitReadFixedFromBlock(
         end
         local valueKind = normalizeTypeKind(valueType.kind)
         local arrayVar = nextTemp(state, "fixedArrayValues")
+        emitDecodeWork(lines, depth, tostring(fixedLength))
         addLine(lines, depth, ("local %s = table.create(%d)"):format(arrayVar, fixedLength))
 
         if valueKind == "bool" then
-            local packedByteCount = nextTemp(state, "fixedArrayPackedByteCount")
             local packedCursor = nextTemp(state, "fixedArrayPackedCursor")
-            local packedIndex = nextTemp(state, "fixedArrayPackedIndex")
-            local unpackIndex = nextTemp(state, "fixedArrayUnpackIndex")
-            local packedByte = nextTemp(state, "fixedArrayPackedByte")
-            local bitIndex = nextTemp(state, "fixedArrayBitIndex")
-            local bitMask = nextTemp(state, "fixedArrayBitMask")
-            addLine(lines, depth, ("local %s = %d"):format(packedByteCount, ((fixedLength + 7) // 8)))
             addLine(lines, depth, ("local %s = %s"):format(packedCursor, readOffset))
-            addLine(lines, depth, ("local %s = 1"):format(unpackIndex))
-            addLine(lines, depth, ("for %s = 1, %s do"):format(packedIndex, packedByteCount))
-            addLine(lines, depth + 1, ("local %s = readu8(%s, %s)"):format(packedByte, payloadVar, packedCursor))
-            addLine(lines, depth + 1, ("%s += 1"):format(packedCursor))
-            addLine(lines, depth + 1, ("local %s = 1"):format(bitMask))
-            addLine(lines, depth + 1, ("for %s = 1, 8 do"):format(bitIndex))
-            addLine(lines, depth + 2, ("if %s > %d then"):format(unpackIndex, fixedLength))
-            addLine(lines, depth + 3, "break")
-            addLine(lines, depth + 2, "end")
-            addLine(lines, depth + 2, ("%s[%s] = band(%s, %s) ~= 0"):format(arrayVar, unpackIndex, packedByte, bitMask))
-            addLine(lines, depth + 2, ("%s += 1"):format(unpackIndex))
-            addLine(lines, depth + 2, ("%s = lshift(%s, 1)"):format(bitMask, bitMask))
-            addLine(lines, depth + 1, "end")
-            addLine(lines, depth, "end")
+            emitReadBoolArray(lines, state, payloadVar, packedCursor, arrayVar, tostring(fixedLength), depth)
             addLine(lines, depth, ("%s = %s"):format(targetVar, arrayVar))
             return
         end
@@ -1210,6 +1363,21 @@ local function emitReadFixedFromBlock(
 
     local structDecl = structByName[kind]
     if structDecl ~= nil then
+        local literalFields = {}
+        local numericOffset = blockOffset
+        for _, field in structDecl.fields do
+            local reader = PRIMITIVE_READERS[normalizeTypeKind(field.type.kind)]
+            if reader == nil then break end
+            literalFields[#literalFields + 1] = ("[%q] = %s(%s, %s)"):format(field.name, reader, payloadVar, offsetExpr(blockVar, numericOffset))
+            numericOffset += PRIMITIVE_BYTES[normalizeTypeKind(field.type.kind)]
+        end
+        if #literalFields == #structDecl.fields then
+            addLine(lines, depth, ("%s = { %s }"):format(targetVar, join(literalFields)))
+            for _, field in structDecl.fields do
+                emitNumericBounds(lines, depth, field.type, fieldAccessExpr(targetVar, field.name), label .. "." .. field.name, validateLevel)
+            end
+            return
+        end
         local structVar = nextTemp(state, "fixedStructValue")
         addLine(lines, depth, ("local %s = {}"):format(structVar))
         local fieldOffset = 0
@@ -1268,6 +1436,7 @@ local function emitReadForType(
         emitError(lines, depth + 1, validateLevel, label .. " out of bounds", "ERR_BOUNDS")
         addLine(lines, depth, "end")
         addLine(lines, depth, ("%s = (%s(%s, %s) :: %s)"):format(targetVar, reader, payloadVar, offsetVar, toLuauType(typeDef)))
+        emitNumericBounds(lines, depth, typeDef, targetVar, label, validateLevel)
         addLine(lines, depth, ("%s = %s"):format(offsetVar, fieldNext))
         return
     end
@@ -1301,22 +1470,16 @@ local function emitReadForType(
             addLine(lines, depth, ("local %s"):format(strLen))
             addLine(lines, depth, ("%s, %s = ReadVarUInt(%s, %s, %s)"):format(strLen, offsetVar, payloadVar, payloadLengthVar, offsetVar))
         elseif widthInfo ~= nil then
-            local lenNext = nextTemp(state, "stringLenNext")
-            addLine(lines, depth, ("local %s = %s + %d"):format(lenNext, offsetVar, widthInfo.bytes))
-            addLine(lines, depth, ("if %s > %s then"):format(lenNext, payloadLengthVar))
-            emitError(lines, depth + 1, validateLevel, label .. " out of bounds", "ERR_BOUNDS")
-            addLine(lines, depth, "end")
-            addLine(lines, depth, ("local %s = %s(%s, %s)"):format(strLen, widthInfo.reader, payloadVar, offsetVar))
-            addLine(lines, depth, ("%s = %s"):format(offsetVar, lenNext))
+            emitFixedLengthRead(lines, state, depth, widthInfo, typeDef, strLen, payloadVar, payloadLengthVar, offsetVar)
         else
             error("Internal string length prefix mismatch")
         end
-        if isValidateBasicOrFull(validateLevel) and declaredMin ~= nil then
+        if declaredMin ~= nil then
             addLine(lines, depth, ("if %s < %d then"):format(strLen, declaredMin))
             emitError(lines, depth + 1, validateLevel, label .. " below minimum length", "ERR_SCHEMA")
             addLine(lines, depth, "end")
         end
-        if isValidateBasicOrFull(validateLevel) and declaredMax ~= nil then
+        if declaredMax ~= nil then
             addLine(lines, depth, ("if %s > %d then"):format(strLen, declaredMax))
             emitError(lines, depth + 1, validateLevel, label .. " exceeds max length", "ERR_SCHEMA")
             addLine(lines, depth, "end")
@@ -1346,22 +1509,16 @@ local function emitReadForType(
             addLine(lines, depth, ("local %s"):format(dataLen))
             addLine(lines, depth, ("%s, %s = ReadVarUInt(%s, %s, %s)"):format(dataLen, offsetVar, payloadVar, payloadLengthVar, offsetVar))
         elseif widthInfo ~= nil then
-            local lenNext = nextTemp(state, "bufferLenNext")
-            addLine(lines, depth, ("local %s = %s + %d"):format(lenNext, offsetVar, widthInfo.bytes))
-            addLine(lines, depth, ("if %s > %s then"):format(lenNext, payloadLengthVar))
-            emitError(lines, depth + 1, validateLevel, label .. " out of bounds", "ERR_BOUNDS")
-            addLine(lines, depth, "end")
-            addLine(lines, depth, ("local %s = %s(%s, %s)"):format(dataLen, widthInfo.reader, payloadVar, offsetVar))
-            addLine(lines, depth, ("%s = %s"):format(offsetVar, lenNext))
+            emitFixedLengthRead(lines, state, depth, widthInfo, typeDef, dataLen, payloadVar, payloadLengthVar, offsetVar)
         else
             error("Internal buffer length prefix mismatch")
         end
-        if isValidateBasicOrFull(validateLevel) and declaredMin ~= nil then
+        if declaredMin ~= nil then
             addLine(lines, depth, ("if %s < %d then"):format(dataLen, declaredMin))
             emitError(lines, depth + 1, validateLevel, label .. " below minimum length", "ERR_SCHEMA")
             addLine(lines, depth, "end")
         end
-        if isValidateBasicOrFull(validateLevel) and declaredMax ~= nil then
+        if declaredMax ~= nil then
             addLine(lines, depth, ("if %s > %d then"):format(dataLen, declaredMax))
             emitError(lines, depth + 1, validateLevel, label .. " exceeds max length", "ERR_SCHEMA")
             addLine(lines, depth, "end")
@@ -1397,7 +1554,11 @@ local function emitReadForType(
         addLine(lines, depth, ("local %s = %s(%s, %s)"):format(xVar, componentReader, payloadVar, offsetVar))
         addLine(lines, depth, ("local %s = %s(%s, %s + %d)"):format(yVar, componentReader, payloadVar, offsetVar, componentBytes))
         addLine(lines, depth, ("local %s = %s(%s, %s + %d)"):format(zVar, componentReader, payloadVar, offsetVar, componentBytes * 2))
+        for _, component in { xVar, yVar, zVar } do
+            emitNumericBounds(lines, depth, componentType, component, label, validateLevel)
+        end
         addLine(lines, depth, ("%s = Vector3.new(%s, %s, %s)"):format(targetVar, xVar, yVar, zVar))
+        emitNumericBounds(lines, depth, typeDef, targetVar .. ".Magnitude", label, validateLevel)
         addLine(lines, depth, ("%s = %s"):format(offsetVar, vectorNext))
         return
     end
@@ -1432,6 +1593,12 @@ local function emitReadForType(
         addLine(lines, depth, ("local %s = %s(%s, %s + %d)"):format(rxVar, rotReader, payloadVar, offsetVar, rotBaseOffset))
         addLine(lines, depth, ("local %s = %s(%s, %s + %d)"):format(ryVar, rotReader, payloadVar, offsetVar, rotBaseOffset + rotBytes))
         addLine(lines, depth, ("local %s = %s(%s, %s + %d)"):format(rzVar, rotReader, payloadVar, offsetVar, rotBaseOffset + rotBytes * 2))
+        for _, component in { pxVar, pyVar, pzVar } do
+            emitNumericBounds(lines, depth, posType, component, label, validateLevel)
+        end
+        for _, component in { rxVar, ryVar, rzVar } do
+            emitNumericBounds(lines, depth, rotType, component, label, validateLevel)
+        end
         addLine(lines, depth, ("%s = CFrame.new(%s, %s, %s) * CFrame.fromOrientation(%s, %s, %s)"):format(targetVar, pxVar, pyVar, pzVar, rxVar, ryVar, rzVar))
         addLine(lines, depth, ("%s = %s"):format(offsetVar, cframeNext))
         return
@@ -1710,23 +1877,17 @@ local function emitReadForType(
                 addLine(lines, depth, ("local %s"):format(countVar))
                 addLine(lines, depth, ("%s, %s = ReadVarUInt(%s, %s, %s)"):format(countVar, offsetVar, payloadVar, payloadLengthVar, offsetVar))
             elseif widthInfo ~= nil then
-                local countNext = nextTemp(state, "arrayCountNext")
-                addLine(lines, depth, ("local %s = %s + %d"):format(countNext, offsetVar, widthInfo.bytes))
-                addLine(lines, depth, ("if %s > %s then"):format(countNext, payloadLengthVar))
-                emitError(lines, depth + 1, validateLevel, label .. " out of bounds", "ERR_BOUNDS")
-                addLine(lines, depth, "end")
-                addLine(lines, depth, ("local %s = %s(%s, %s)"):format(countVar, widthInfo.reader, payloadVar, offsetVar))
-                addLine(lines, depth, ("%s = %s"):format(offsetVar, countNext))
+                emitFixedLengthRead(lines, state, depth, widthInfo, typeDef, countVar, payloadVar, payloadLengthVar, offsetVar)
             else
                 error("Internal array length prefix mismatch")
             end
         end
-        if minLen ~= nil and isValidateBasicOrFull(validateLevel) then
+        if minLen ~= nil then
             addLine(lines, depth, ("if %s < %d then"):format(countVar, minLen))
             emitError(lines, depth + 1, validateLevel, label .. " below minimum array length", "ERR_SCHEMA")
             addLine(lines, depth, "end")
         end
-        if maxLen ~= nil and isValidateBasicOrFull(validateLevel) then
+        if maxLen ~= nil then
             addLine(lines, depth, ("if %s > %d then"):format(countVar, maxLen))
             emitError(lines, depth + 1, validateLevel, label .. " exceeds array bound", "ERR_SCHEMA")
             addLine(lines, depth, "end")
@@ -1736,6 +1897,8 @@ local function emitReadForType(
             emitError(lines, depth + 1, validateLevel, label .. " exceeds varint limit", "ERR_SCHEMA")
             addLine(lines, depth, "end")
         end
+        emitArrayAllocationCheck(lines, depth, typeDef, valueType, countVar, offsetVar, payloadLengthVar, structByName)
+        emitDecodeWork(lines, depth, tostring(countVar))
         addLine(lines, depth, ("local %s = table.create(%s)"):format(arrayVar, countVar))
         if fixedArrayTotalSize ~= nil then
             local arrayBlock = nextTemp(state, "arrayFixedBlock")
@@ -1752,29 +1915,9 @@ local function emitReadForType(
                 label
             )
             if valueKind == "bool" then
-                local packedByteCount = nextTemp(state, "arrayPackedByteCount")
                 local packedCursor = nextTemp(state, "arrayPackedCursor")
-                local packedIndex = nextTemp(state, "arrayPackedIndex")
-                local unpackIndex = nextTemp(state, "arrayUnpackIndex")
-                local packedByte = nextTemp(state, "arrayPackedByte")
-                local bitIndex = nextTemp(state, "arrayBitIndex")
-                local bitMask = nextTemp(state, "arrayBitMask")
-                addLine(lines, depth, ("local %s = ((%s + 7) // 8)"):format(packedByteCount, countVar))
                 addLine(lines, depth, ("local %s = %s"):format(packedCursor, arrayBlock))
-                addLine(lines, depth, ("local %s = 1"):format(unpackIndex))
-                addLine(lines, depth, ("for %s = 1, %s do"):format(packedIndex, packedByteCount))
-                addLine(lines, depth + 1, ("local %s = readu8(%s, %s)"):format(packedByte, payloadVar, packedCursor))
-                addLine(lines, depth + 1, ("%s += 1"):format(packedCursor))
-                addLine(lines, depth + 1, ("local %s = 1"):format(bitMask))
-                addLine(lines, depth + 1, ("for %s = 1, 8 do"):format(bitIndex))
-                addLine(lines, depth + 2, ("if %s > %s then"):format(unpackIndex, countVar))
-                addLine(lines, depth + 3, "break")
-                addLine(lines, depth + 2, "end")
-                addLine(lines, depth + 2, ("%s[%s] = band(%s, %s) ~= 0"):format(arrayVar, unpackIndex, packedByte, bitMask))
-                addLine(lines, depth + 2, ("%s += 1"):format(unpackIndex))
-                addLine(lines, depth + 2, ("%s = lshift(%s, 1)"):format(bitMask, bitMask))
-                addLine(lines, depth + 1, "end")
-                addLine(lines, depth, "end")
+                emitReadBoolArray(lines, state, payloadVar, packedCursor, arrayVar, countVar, depth)
             else
                 if fixedArrayElementSize == nil then
                     error("Internal fixedarray decode element size mismatch")
@@ -1804,36 +1947,24 @@ local function emitReadForType(
             local packedByteCount = nextTemp(state, "arrayPackedByteCount")
             local packedCursor = nextTemp(state, "arrayPackedCursor")
             local packedNext = nextTemp(state, "arrayPackedNext")
-            local packedIndex = nextTemp(state, "arrayPackedIndex")
-            local unpackIndex = nextTemp(state, "arrayUnpackIndex")
-            local packedByte = nextTemp(state, "arrayPackedByte")
-            local bitIndex = nextTemp(state, "arrayBitIndex")
-            local bitMask = nextTemp(state, "arrayBitMask")
             addLine(lines, depth, ("local %s = ((%s + 7) // 8)"):format(packedByteCount, countVar))
             addLine(lines, depth, ("local %s = %s"):format(packedCursor, offsetVar))
             addLine(lines, depth, ("local %s = %s + %s"):format(packedNext, packedCursor, packedByteCount))
             addLine(lines, depth, ("if %s > %s then"):format(packedNext, payloadLengthVar))
             emitError(lines, depth + 1, validateLevel, label .. " out of bounds", "ERR_BOUNDS")
             addLine(lines, depth, "end")
-            addLine(lines, depth, ("local %s = 1"):format(unpackIndex))
-            addLine(lines, depth, ("for %s = 1, %s do"):format(packedIndex, packedByteCount))
-            addLine(lines, depth + 1, ("local %s = readu8(%s, %s)"):format(packedByte, payloadVar, packedCursor))
-            addLine(lines, depth + 1, ("%s += 1"):format(packedCursor))
-            addLine(lines, depth + 1, ("local %s = 1"):format(bitMask))
-            addLine(lines, depth + 1, ("for %s = 1, 8 do"):format(bitIndex))
-            addLine(lines, depth + 2, ("if %s > %s then"):format(unpackIndex, countVar))
-            addLine(lines, depth + 3, "break")
-            addLine(lines, depth + 2, "end")
-            addLine(lines, depth + 2, ("%s[%s] = band(%s, %s) ~= 0"):format(arrayVar, unpackIndex, packedByte, bitMask))
-            addLine(lines, depth + 2, ("%s += 1"):format(unpackIndex))
-            addLine(lines, depth + 2, ("%s = lshift(%s, 1)"):format(bitMask, bitMask))
-            addLine(lines, depth + 1, "end")
-            addLine(lines, depth, "end")
+            emitReadBoolArray(lines, state, payloadVar, packedCursor, arrayVar, countVar, depth)
             addLine(lines, depth, ("%s = %s"):format(offsetVar, packedCursor))
         else
             addLine(lines, depth, ("for %s = 1, %s do"):format(indexVar, countVar))
             addLine(lines, depth + 1, ("local %s"):format(valueVar))
-            emitReadForType(lines, state, valueType, valueVar, label .. "[]", payloadVar, payloadLengthVar, offsetVar, depth + 1, validateLevel, structByName)
+            local elementSize = computeFixedByteSize(valueType, structByName, {})
+            if elementSize ~= nil then
+                emitReadFixedFromBlock(lines, state, valueType, valueVar, label .. "[]", payloadVar, offsetVar, 0, depth + 1, validateLevel, structByName)
+                addLine(lines, depth + 1, ("%s += %d"):format(offsetVar, elementSize))
+            else
+                emitReadForType(lines, state, valueType, valueVar, label .. "[]", payloadVar, payloadLengthVar, offsetVar, depth + 1, validateLevel, structByName)
+            end
             addLine(lines, depth + 1, ("%s[%s] = %s"):format(arrayVar, indexVar, valueVar))
             addLine(lines, depth, "end")
         end
@@ -1860,22 +1991,16 @@ local function emitReadForType(
             addLine(lines, depth, ("local %s"):format(countVar))
             addLine(lines, depth, ("%s, %s = ReadVarUInt(%s, %s, %s)"):format(countVar, offsetVar, payloadVar, payloadLengthVar, offsetVar))
         elseif widthInfo ~= nil then
-            local countNext = nextTemp(state, "mapCountNext")
-            addLine(lines, depth, ("local %s = %s + %d"):format(countNext, offsetVar, widthInfo.bytes))
-            addLine(lines, depth, ("if %s > %s then"):format(countNext, payloadLengthVar))
-            emitError(lines, depth + 1, validateLevel, label .. " out of bounds", "ERR_BOUNDS")
-            addLine(lines, depth, "end")
-            addLine(lines, depth, ("local %s = %s(%s, %s)"):format(countVar, widthInfo.reader, payloadVar, offsetVar))
-            addLine(lines, depth, ("%s = %s"):format(offsetVar, countNext))
+            emitFixedLengthRead(lines, state, depth, widthInfo, typeDef, countVar, payloadVar, payloadLengthVar, offsetVar)
         else
             error("Internal map length prefix mismatch")
         end
-        if isValidateBasicOrFull(validateLevel) and minLen ~= nil then
+        if minLen ~= nil then
             addLine(lines, depth, ("if %s < %d then"):format(countVar, minLen))
             emitError(lines, depth + 1, validateLevel, label .. " below minimum map size", "ERR_SCHEMA")
             addLine(lines, depth, "end")
         end
-        if isValidateBasicOrFull(validateLevel) and maxLen ~= nil then
+        if maxLen ~= nil then
             addLine(lines, depth, ("if %s > %d then"):format(countVar, maxLen))
             emitError(lines, depth + 1, validateLevel, label .. " exceeds map bound", "ERR_SCHEMA")
             addLine(lines, depth, "end")
@@ -1885,6 +2010,7 @@ local function emitReadForType(
             emitError(lines, depth + 1, validateLevel, label .. " exceeds varint limit", "ERR_SCHEMA")
             addLine(lines, depth, "end")
         end
+        emitDecodeWork(lines, depth, countVar .. " * 2")
         addLine(lines, depth, ("local %s = {}"):format(mapVar))
         addLine(lines, depth, ("for %s = 1, %s do"):format(indexVar, countVar))
         addLine(lines, depth + 1, ("local %s"):format(keyVar))
@@ -1979,22 +2105,16 @@ local function emitSkipForType(
             addLine(lines, depth, ("local %s"):format(strLen))
             addLine(lines, depth, ("%s, %s = ReadVarUInt(%s, %s, %s)"):format(strLen, offsetVar, payloadVar, payloadLengthVar, offsetVar))
         elseif widthInfo ~= nil then
-            local lenNext = nextTemp(state, "skipStringLenNext")
-            addLine(lines, depth, ("local %s = %s + %d"):format(lenNext, offsetVar, widthInfo.bytes))
-            addLine(lines, depth, ("if %s > %s then"):format(lenNext, payloadLengthVar))
-            emitError(lines, depth + 1, validateLevel, label .. " out of bounds", "ERR_BOUNDS")
-            addLine(lines, depth, "end")
-            addLine(lines, depth, ("local %s = %s(%s, %s)"):format(strLen, widthInfo.reader, payloadVar, offsetVar))
-            addLine(lines, depth, ("%s = %s"):format(offsetVar, lenNext))
+            emitFixedLengthRead(lines, state, depth, widthInfo, typeDef, strLen, payloadVar, payloadLengthVar, offsetVar)
         else
             error("Internal string length prefix mismatch")
         end
-        if isValidateBasicOrFull(validateLevel) and declaredMin ~= nil then
+        if declaredMin ~= nil then
             addLine(lines, depth, ("if %s < %d then"):format(strLen, declaredMin))
             emitError(lines, depth + 1, validateLevel, label .. " below minimum length", "ERR_SCHEMA")
             addLine(lines, depth, "end")
         end
-        if isValidateBasicOrFull(validateLevel) and declaredMax ~= nil then
+        if declaredMax ~= nil then
             addLine(lines, depth, ("if %s > %d then"):format(strLen, declaredMax))
             emitError(lines, depth + 1, validateLevel, label .. " exceeds max length", "ERR_SCHEMA")
             addLine(lines, depth, "end")
@@ -2023,22 +2143,16 @@ local function emitSkipForType(
             addLine(lines, depth, ("local %s"):format(dataLen))
             addLine(lines, depth, ("%s, %s = ReadVarUInt(%s, %s, %s)"):format(dataLen, offsetVar, payloadVar, payloadLengthVar, offsetVar))
         elseif widthInfo ~= nil then
-            local lenNext = nextTemp(state, "skipBufferLenNext")
-            addLine(lines, depth, ("local %s = %s + %d"):format(lenNext, offsetVar, widthInfo.bytes))
-            addLine(lines, depth, ("if %s > %s then"):format(lenNext, payloadLengthVar))
-            emitError(lines, depth + 1, validateLevel, label .. " out of bounds", "ERR_BOUNDS")
-            addLine(lines, depth, "end")
-            addLine(lines, depth, ("local %s = %s(%s, %s)"):format(dataLen, widthInfo.reader, payloadVar, offsetVar))
-            addLine(lines, depth, ("%s = %s"):format(offsetVar, lenNext))
+            emitFixedLengthRead(lines, state, depth, widthInfo, typeDef, dataLen, payloadVar, payloadLengthVar, offsetVar)
         else
             error("Internal buffer length prefix mismatch")
         end
-        if isValidateBasicOrFull(validateLevel) and declaredMin ~= nil then
+        if declaredMin ~= nil then
             addLine(lines, depth, ("if %s < %d then"):format(dataLen, declaredMin))
             emitError(lines, depth + 1, validateLevel, label .. " below minimum length", "ERR_SCHEMA")
             addLine(lines, depth, "end")
         end
-        if isValidateBasicOrFull(validateLevel) and declaredMax ~= nil then
+        if declaredMax ~= nil then
             addLine(lines, depth, ("if %s > %d then"):format(dataLen, declaredMax))
             emitError(lines, depth + 1, validateLevel, label .. " exceeds max length", "ERR_SCHEMA")
             addLine(lines, depth, "end")
@@ -2268,23 +2382,17 @@ local function emitSkipForType(
                 addLine(lines, depth, ("local %s"):format(countVar))
                 addLine(lines, depth, ("%s, %s = ReadVarUInt(%s, %s, %s)"):format(countVar, offsetVar, payloadVar, payloadLengthVar, offsetVar))
             elseif widthInfo ~= nil then
-                local countNext = nextTemp(state, "skipArrayCountNext")
-                addLine(lines, depth, ("local %s = %s + %d"):format(countNext, offsetVar, widthInfo.bytes))
-                addLine(lines, depth, ("if %s > %s then"):format(countNext, payloadLengthVar))
-                emitError(lines, depth + 1, validateLevel, label .. " out of bounds", "ERR_BOUNDS")
-                addLine(lines, depth, "end")
-                addLine(lines, depth, ("local %s = %s(%s, %s)"):format(countVar, widthInfo.reader, payloadVar, offsetVar))
-                addLine(lines, depth, ("%s = %s"):format(offsetVar, countNext))
+                emitFixedLengthRead(lines, state, depth, widthInfo, typeDef, countVar, payloadVar, payloadLengthVar, offsetVar)
             else
                 error("Internal array length prefix mismatch")
             end
         end
-        if minLen ~= nil and isValidateBasicOrFull(validateLevel) then
+        if minLen ~= nil then
             addLine(lines, depth, ("if %s < %d then"):format(countVar, minLen))
             emitError(lines, depth + 1, validateLevel, label .. " below minimum array length", "ERR_SCHEMA")
             addLine(lines, depth, "end")
         end
-        if maxLen ~= nil and isValidateBasicOrFull(validateLevel) then
+        if maxLen ~= nil then
             addLine(lines, depth, ("if %s > %d then"):format(countVar, maxLen))
             emitError(lines, depth + 1, validateLevel, label .. " exceeds array bound", "ERR_SCHEMA")
             addLine(lines, depth, "end")
@@ -2294,6 +2402,7 @@ local function emitSkipForType(
             emitError(lines, depth + 1, validateLevel, label .. " exceeds varint limit", "ERR_SCHEMA")
             addLine(lines, depth, "end")
         end
+        emitDecodeWork(lines, depth, countVar)
         if fixedArraySkipBytes ~= nil then
             local fixedSkipNext = nextTemp(state, "skipArrayFixedNext")
             addLine(lines, depth, ("local %s = %s + %d"):format(fixedSkipNext, offsetVar, fixedArraySkipBytes))
@@ -2334,22 +2443,16 @@ local function emitSkipForType(
             addLine(lines, depth, ("local %s"):format(countVar))
             addLine(lines, depth, ("%s, %s = ReadVarUInt(%s, %s, %s)"):format(countVar, offsetVar, payloadVar, payloadLengthVar, offsetVar))
         elseif widthInfo ~= nil then
-            local countNext = nextTemp(state, "skipMapCountNext")
-            addLine(lines, depth, ("local %s = %s + %d"):format(countNext, offsetVar, widthInfo.bytes))
-            addLine(lines, depth, ("if %s > %s then"):format(countNext, payloadLengthVar))
-            emitError(lines, depth + 1, validateLevel, label .. " out of bounds", "ERR_BOUNDS")
-            addLine(lines, depth, "end")
-            addLine(lines, depth, ("local %s = %s(%s, %s)"):format(countVar, widthInfo.reader, payloadVar, offsetVar))
-            addLine(lines, depth, ("%s = %s"):format(offsetVar, countNext))
+            emitFixedLengthRead(lines, state, depth, widthInfo, typeDef, countVar, payloadVar, payloadLengthVar, offsetVar)
         else
             error("Internal map length prefix mismatch")
         end
-        if isValidateBasicOrFull(validateLevel) and minLen ~= nil then
+        if minLen ~= nil then
             addLine(lines, depth, ("if %s < %d then"):format(countVar, minLen))
             emitError(lines, depth + 1, validateLevel, label .. " below minimum map size", "ERR_SCHEMA")
             addLine(lines, depth, "end")
         end
-        if isValidateBasicOrFull(validateLevel) and maxLen ~= nil then
+        if maxLen ~= nil then
             addLine(lines, depth, ("if %s > %d then"):format(countVar, maxLen))
             emitError(lines, depth + 1, validateLevel, label .. " exceeds map bound", "ERR_SCHEMA")
             addLine(lines, depth, "end")
@@ -2359,6 +2462,7 @@ local function emitSkipForType(
             emitError(lines, depth + 1, validateLevel, label .. " exceeds varint limit", "ERR_SCHEMA")
             addLine(lines, depth, "end")
         end
+        emitDecodeWork(lines, depth, countVar .. " * 2")
         addLine(lines, depth, ("for %s = 1, %s do"):format(indexVar, countVar))
         emitSkipForType(lines, state, keyType, label .. " key", payloadVar, payloadLengthVar, offsetVar, depth + 1, validateLevel, structByName)
         emitSkipForType(lines, state, valueType, label .. " value", payloadVar, payloadLengthVar, offsetVar, depth + 1, validateLevel, structByName)
@@ -2534,7 +2638,12 @@ local function emitCanonicalSizeForType(
         end
         addLine(lines, depth, ("local %s = #%s"):format(lenVar, valueExpr))
         cacheCollectionHint(stringLenHints, depth, "string", valueExpr, lenVar)
-        if isValidateBasicOrFull(validateLevel) and declaredMax ~= nil then
+        if typeDef.min ~= nil then
+            addLine(lines, depth, ("if %s < %d then"):format(lenVar, typeDef.min))
+            emitError(lines, depth + 1, validateLevel, label .. " below minimum length", "ERR_SCHEMA")
+            addLine(lines, depth, "end")
+        end
+        if declaredMax ~= nil then
             addLine(lines, depth, ("if %s > %d then"):format(lenVar, declaredMax))
             emitError(lines, depth + 1, validateLevel, label .. " exceeds max length", "ERR_SCHEMA")
             addLine(lines, depth, "end")
@@ -2619,15 +2728,18 @@ local function emitCanonicalSizeForType(
         end
         addLine(lines, depth, ("local %s = #%s"):format(lenVar, valueExpr))
         cacheCollectionHint(stringLenHints, depth, "array", valueExpr, lenVar)
+        if not isFixedArray then
+            addLine(lines, depth, ("if %s > %d then error(ERR_SCHEMA) end"):format(lenVar, declaredMax or 65535))
+        end
         if fixedLength ~= nil then
             addLine(lines, depth, ("if %s ~= %d then"):format(lenVar, fixedLength))
             emitError(lines, depth + 1, validateLevel, label .. " has invalid fixedarray length", "ERR_SCHEMA")
             addLine(lines, depth, "end")
-        elseif isValidateBasicOrFull(validateLevel) and declaredMin ~= nil then
+        elseif declaredMin ~= nil then
             addLine(lines, depth, ("if %s < %d then"):format(lenVar, declaredMin))
             emitError(lines, depth + 1, validateLevel, label .. " below minimum array length", "ERR_SCHEMA")
             addLine(lines, depth, "end")
-        elseif isValidateBasicOrFull(validateLevel) and declaredMax ~= nil then
+        elseif declaredMax ~= nil then
             addLine(lines, depth, ("if %s > %d then"):format(lenVar, declaredMax))
             emitError(lines, depth + 1, validateLevel, label .. " exceeds array bound", "ERR_SCHEMA")
             addLine(lines, depth, "end")
@@ -2684,6 +2796,9 @@ local function emitCanonicalSizeForType(
                 addLine(lines, depth, "end")
             end
             addLine(lines, depth, ("%s += ((%s + 7) // 8)"):format(varSizeVar, lenVar))
+        elseif uncheckedElementSize(valueType, validateLevel, structByName) ~= nil then
+            local elementSize = uncheckedElementSize(valueType, validateLevel, structByName)
+            addLine(lines, depth, ("%s += %s * %d"):format(varSizeVar, lenVar, elementSize))
         else
             addLine(lines, depth, ("for %s = 1, %s do"):format(indexVar, lenVar))
             emitSizeForType(
@@ -2726,7 +2841,7 @@ local function emitCanonicalSizeForType(
         addLine(lines, depth, ("local %s, %s = next(%s, nil)"):format(mapKey, mapValue, valueExpr))
         addLine(lines, depth, ("while %s ~= nil do"):format(mapKey))
         addLine(lines, depth + 1, ("%s += 1"):format(mapCount))
-        if isValidateBasicOrFull(validateLevel) and declaredMax ~= nil then
+        if declaredMax ~= nil then
             addLine(lines, depth + 1, ("if %s > %d then"):format(mapCount, declaredMax))
             emitError(lines, depth + 2, validateLevel, label .. " exceeds map bound", "ERR_SCHEMA")
             addLine(lines, depth + 1, "end")
@@ -2735,7 +2850,7 @@ local function emitCanonicalSizeForType(
         emitSizeForType(lines, state, valueType, mapValue, label .. " value", varSizeVar, depth + 1, validateLevel, structByName, nil)
         addLine(lines, depth + 1, ("%s, %s = next(%s, %s)"):format(mapKey, mapValue, valueExpr, mapKey))
         addLine(lines, depth, "end")
-        if isValidateBasicOrFull(validateLevel) and declaredMin ~= nil then
+        if declaredMin ~= nil then
             addLine(lines, depth, ("if %s < %d then"):format(mapCount, declaredMin))
             emitError(lines, depth + 1, validateLevel, label .. " below minimum map size", "ERR_SCHEMA")
             addLine(lines, depth, "end")
@@ -2825,7 +2940,7 @@ local function emitWriteCanonicalForType(
         if prefixInfo.isVarint then
             addLine(lines, depth, ("%s = WriteVarUInt(%s, %s, %s)"):format(prefixVar, bufferVar, prefixVar, lenExpr))
         elseif widthInfo ~= nil then
-            addLine(lines, depth, ("%s(%s, %s, %s)"):format(widthInfo.writer, bufferVar, prefixVar, lenExpr))
+            emitFixedLengthWrite(lines, depth, widthInfo, typeDef, bufferVar, prefixVar, lenExpr)
             addLine(lines, depth, ("%s += %d"):format(prefixVar, widthInfo.bytes))
         else
             error("Internal string length prefix mismatch")
@@ -2898,43 +3013,15 @@ local function emitWriteCanonicalForType(
             elseif prefixInfo.isVarint then
                 addLine(lines, depth, ("%s = WriteVarUInt(%s, %s, %s)"):format(prefixVar, bufferVar, prefixVar, lenExpr))
             elseif widthInfo ~= nil then
-                addLine(lines, depth, ("%s(%s, %s, %s)"):format(widthInfo.writer, bufferVar, prefixVar, lenExpr))
+                emitFixedLengthWrite(lines, depth, widthInfo, typeDef, bufferVar, prefixVar, lenExpr)
                 addLine(lines, depth, ("%s += %d"):format(prefixVar, widthInfo.bytes))
             else
                 error("Internal array length prefix mismatch")
             end
         end
         if valueKind == "bool" then
-            local packedByteCount = nextTemp(state, "arrayPackedByteCount")
-            local packedIndex = nextTemp(state, "arrayPackedIndex")
-            local valueIndex = nextTemp(state, "arrayValueIndex")
-            local bitIndex = nextTemp(state, "arrayBitIndex")
-            local bitMask = nextTemp(state, "arrayBitMask")
-            local packedByte = nextTemp(state, "arrayPackedByte")
-            if fixedLength ~= nil then
-                local constantPackedBytes = ((fixedLength + 7) // 8)
-                addLine(lines, depth, ("local %s = %d"):format(packedByteCount, constantPackedBytes))
-            else
-                addLine(lines, depth, ("local %s = ((%s + 7) // 8)"):format(packedByteCount, lenExpr))
-            end
-            addLine(lines, depth, ("local %s = 1"):format(valueIndex))
-            addLine(lines, depth, ("for %s = 1, %s do"):format(packedIndex, packedByteCount))
-            addLine(lines, depth + 1, ("local %s = 0"):format(packedByte))
-            addLine(lines, depth + 1, ("local %s = 1"):format(bitMask))
-            addLine(lines, depth + 1, ("for %s = 1, 8 do"):format(bitIndex))
             local loopBoundExpr = if fixedLength ~= nil then tostring(fixedLength) else lenExpr
-            addLine(lines, depth + 2, ("if %s > %s then"):format(valueIndex, loopBoundExpr))
-            addLine(lines, depth + 3, "break")
-            addLine(lines, depth + 2, "end")
-            addLine(lines, depth + 2, ("if %s[%s] then"):format(valueExpr, valueIndex))
-            addLine(lines, depth + 3, ("%s = bor(%s, %s)"):format(packedByte, packedByte, bitMask))
-            addLine(lines, depth + 2, "end")
-            addLine(lines, depth + 2, ("%s += 1"):format(valueIndex))
-            addLine(lines, depth + 2, ("%s = lshift(%s, 1)"):format(bitMask, bitMask))
-            addLine(lines, depth + 1, "end")
-            addLine(lines, depth + 1, ("writeu8(%s, %s, %s)"):format(bufferVar, varVar, packedByte))
-            addLine(lines, depth + 1, ("%s += 1"):format(varVar))
-            addLine(lines, depth, "end")
+            emitWriteBoolArray(lines, state, valueExpr, loopBoundExpr, bufferVar, varVar, depth)
         else
             local loopBoundExpr = if fixedLength ~= nil then tostring(fixedLength) else lenExpr
             addLine(lines, depth, ("for %s = 1, %s do"):format(indexVar, loopBoundExpr))
@@ -2972,7 +3059,7 @@ local function emitWriteCanonicalForType(
         if prefixInfo.isVarint then
             addLine(lines, depth, ("%s = WriteVarUInt(%s, %s, %s)"):format(prefixVar, bufferVar, prefixVar, countExpr))
         elseif widthInfo ~= nil then
-            addLine(lines, depth, ("%s(%s, %s, %s)"):format(widthInfo.writer, bufferVar, prefixVar, countExpr))
+            emitFixedLengthWrite(lines, depth, widthInfo, typeDef, bufferVar, prefixVar, countExpr)
             addLine(lines, depth, ("%s += %d"):format(prefixVar, widthInfo.bytes))
         else
             error("Internal map length prefix mismatch")
@@ -3060,22 +3147,16 @@ local function emitDecodeCanonicalPrefixForType(
             addLine(lines, depth, ("local %s"):format(lenVar))
             addLine(lines, depth, ("%s, %s = ReadVarUInt(%s, %s, %s)"):format(lenVar, prefixVar, payloadVar, payloadLengthVar, prefixVar))
         elseif widthInfo ~= nil then
-            local lenNext = nextTemp(state, "prefixNext")
-            addLine(lines, depth, ("local %s = %s + %d"):format(lenNext, prefixVar, widthInfo.bytes))
-            addLine(lines, depth, ("if %s > %s then"):format(lenNext, payloadLengthVar))
-            emitError(lines, depth + 1, validateLevel, label .. " out of bounds", "ERR_BOUNDS")
-            addLine(lines, depth, "end")
-            addLine(lines, depth, ("local %s = %s(%s, %s)"):format(lenVar, widthInfo.reader, payloadVar, prefixVar))
-            addLine(lines, depth, ("%s = %s"):format(prefixVar, lenNext))
+            emitFixedLengthRead(lines, state, depth, widthInfo, typeDef, lenVar, payloadVar, payloadLengthVar, prefixVar)
         else
             error("Internal string length prefix mismatch")
         end
-        if isValidateBasicOrFull(validateLevel) and declaredMin ~= nil then
+        if declaredMin ~= nil then
             addLine(lines, depth, ("if %s < %d then"):format(lenVar, declaredMin))
             emitError(lines, depth + 1, validateLevel, label .. " below minimum length", "ERR_SCHEMA")
             addLine(lines, depth, "end")
         end
-        if isValidateBasicOrFull(validateLevel) and declaredMax ~= nil then
+        if declaredMax ~= nil then
             addLine(lines, depth, ("if %s > %d then"):format(lenVar, declaredMax))
             emitError(lines, depth + 1, validateLevel, label .. " exceeds max length", "ERR_SCHEMA")
             addLine(lines, depth, "end")
@@ -3122,22 +3203,16 @@ local function emitDecodeCanonicalPrefixForType(
                 addLine(lines, depth, ("local %s"):format(countVar))
                 addLine(lines, depth, ("%s, %s = ReadVarUInt(%s, %s, %s)"):format(countVar, prefixVar, payloadVar, payloadLengthVar, prefixVar))
             elseif widthInfo ~= nil then
-                local countNext = nextTemp(state, "prefixNext")
-                addLine(lines, depth, ("local %s = %s + %d"):format(countNext, prefixVar, widthInfo.bytes))
-                addLine(lines, depth, ("if %s > %s then"):format(countNext, payloadLengthVar))
-                emitError(lines, depth + 1, validateLevel, label .. " out of bounds", "ERR_BOUNDS")
-                addLine(lines, depth, "end")
-                addLine(lines, depth, ("local %s = %s(%s, %s)"):format(countVar, widthInfo.reader, payloadVar, prefixVar))
-                addLine(lines, depth, ("%s = %s"):format(prefixVar, countNext))
+                emitFixedLengthRead(lines, state, depth, widthInfo, typeDef, countVar, payloadVar, payloadLengthVar, prefixVar)
             else
                 error("Internal array length prefix mismatch")
             end
-            if isValidateBasicOrFull(validateLevel) and declaredMin ~= nil then
+            if declaredMin ~= nil then
                 addLine(lines, depth, ("if %s < %d then"):format(countVar, declaredMin))
                 emitError(lines, depth + 1, validateLevel, label .. " below minimum array length", "ERR_SCHEMA")
                 addLine(lines, depth, "end")
             end
-            if isValidateBasicOrFull(validateLevel) and declaredMax ~= nil then
+            if declaredMax ~= nil then
                 addLine(lines, depth, ("if %s > %d then"):format(countVar, declaredMax))
                 emitError(lines, depth + 1, validateLevel, label .. " exceeds array bound", "ERR_SCHEMA")
                 addLine(lines, depth, "end")
@@ -3160,22 +3235,16 @@ local function emitDecodeCanonicalPrefixForType(
             addLine(lines, depth, ("local %s"):format(countVar))
             addLine(lines, depth, ("%s, %s = ReadVarUInt(%s, %s, %s)"):format(countVar, prefixVar, payloadVar, payloadLengthVar, prefixVar))
         elseif widthInfo ~= nil then
-            local countNext = nextTemp(state, "prefixNext")
-            addLine(lines, depth, ("local %s = %s + %d"):format(countNext, prefixVar, widthInfo.bytes))
-            addLine(lines, depth, ("if %s > %s then"):format(countNext, payloadLengthVar))
-            emitError(lines, depth + 1, validateLevel, label .. " out of bounds", "ERR_BOUNDS")
-            addLine(lines, depth, "end")
-            addLine(lines, depth, ("local %s = %s(%s, %s)"):format(countVar, widthInfo.reader, payloadVar, prefixVar))
-            addLine(lines, depth, ("%s = %s"):format(prefixVar, countNext))
+            emitFixedLengthRead(lines, state, depth, widthInfo, typeDef, countVar, payloadVar, payloadLengthVar, prefixVar)
         else
             error("Internal map length prefix mismatch")
         end
-        if isValidateBasicOrFull(validateLevel) and declaredMin ~= nil then
+        if declaredMin ~= nil then
             addLine(lines, depth, ("if %s < %d then"):format(countVar, declaredMin))
             emitError(lines, depth + 1, validateLevel, label .. " below minimum map size", "ERR_SCHEMA")
             addLine(lines, depth, "end")
         end
-        if isValidateBasicOrFull(validateLevel) and declaredMax ~= nil then
+        if declaredMax ~= nil then
             addLine(lines, depth, ("if %s > %d then"):format(countVar, declaredMax))
             emitError(lines, depth + 1, validateLevel, label .. " exceeds map bound", "ERR_SCHEMA")
             addLine(lines, depth, "end")
@@ -3232,6 +3301,7 @@ local function emitDecodeCanonicalDataForType(
     local primitiveBytes = PRIMITIVE_BYTES[kind]
     if reader ~= nil and primitiveBytes ~= nil then
         addLine(lines, depth, ("%s = (%s(%s, %s) :: %s)"):format(targetVar, reader, payloadVar, fixedVar, toLuauType(typeDef)))
+        emitNumericBounds(lines, depth, typeDef, targetVar, label, validateLevel)
         addLine(lines, depth, ("%s += %d"):format(fixedVar, primitiveBytes))
         return
     end
@@ -3317,6 +3387,8 @@ local function emitDecodeCanonicalDataForType(
         local indexVar = nextTemp(state, "arrayIndex")
         local arrayVar = nextTemp(state, "arrayValues")
         local valueVar = nextTemp(state, "arrayValue")
+        emitArrayAllocationCheck(lines, depth, typeDef, valueType, countVar, varVar, payloadLengthVar, structByName)
+        emitDecodeWork(lines, depth, tostring(countVar))
         addLine(lines, depth, ("local %s = table.create(%s)"):format(arrayVar, countVar))
         if fixedArrayTotalSize ~= nil then
             local arrayBlock = nextTemp(state, "arrayFixedBlock")
@@ -3333,29 +3405,9 @@ local function emitDecodeCanonicalDataForType(
                 label
             )
             if valueKind == "bool" then
-                local packedByteCount = nextTemp(state, "arrayPackedByteCount")
                 local packedCursor = nextTemp(state, "arrayPackedCursor")
-                local packedIndex = nextTemp(state, "arrayPackedIndex")
-                local unpackIndex = nextTemp(state, "arrayUnpackIndex")
-                local packedByte = nextTemp(state, "arrayPackedByte")
-                local bitIndex = nextTemp(state, "arrayBitIndex")
-                local bitMask = nextTemp(state, "arrayBitMask")
-                addLine(lines, depth, ("local %s = ((%s + 7) // 8)"):format(packedByteCount, countVar))
                 addLine(lines, depth, ("local %s = %s"):format(packedCursor, arrayBlock))
-                addLine(lines, depth, ("local %s = 1"):format(unpackIndex))
-                addLine(lines, depth, ("for %s = 1, %s do"):format(packedIndex, packedByteCount))
-                addLine(lines, depth + 1, ("local %s = readu8(%s, %s)"):format(packedByte, payloadVar, packedCursor))
-                addLine(lines, depth + 1, ("%s += 1"):format(packedCursor))
-                addLine(lines, depth + 1, ("local %s = 1"):format(bitMask))
-                addLine(lines, depth + 1, ("for %s = 1, 8 do"):format(bitIndex))
-                addLine(lines, depth + 2, ("if %s > %s then"):format(unpackIndex, countVar))
-                addLine(lines, depth + 3, "break")
-                addLine(lines, depth + 2, "end")
-                addLine(lines, depth + 2, ("%s[%s] = band(%s, %s) ~= 0"):format(arrayVar, unpackIndex, packedByte, bitMask))
-                addLine(lines, depth + 2, ("%s += 1"):format(unpackIndex))
-                addLine(lines, depth + 2, ("%s = lshift(%s, 1)"):format(bitMask, bitMask))
-                addLine(lines, depth + 1, "end")
-                addLine(lines, depth, "end")
+                emitReadBoolArray(lines, state, payloadVar, packedCursor, arrayVar, countVar, depth)
             else
                 if fixedArrayElementSize == nil then
                     error("Internal canonical fixedarray decode element size mismatch")
@@ -3385,36 +3437,24 @@ local function emitDecodeCanonicalDataForType(
             local packedByteCount = nextTemp(state, "arrayPackedByteCount")
             local packedCursor = nextTemp(state, "arrayPackedCursor")
             local packedNext = nextTemp(state, "arrayPackedNext")
-            local packedIndex = nextTemp(state, "arrayPackedIndex")
-            local unpackIndex = nextTemp(state, "arrayUnpackIndex")
-            local packedByte = nextTemp(state, "arrayPackedByte")
-            local bitIndex = nextTemp(state, "arrayBitIndex")
-            local bitMask = nextTemp(state, "arrayBitMask")
             addLine(lines, depth, ("local %s = ((%s + 7) // 8)"):format(packedByteCount, countVar))
             addLine(lines, depth, ("local %s = %s"):format(packedCursor, varVar))
             addLine(lines, depth, ("local %s = %s + %s"):format(packedNext, packedCursor, packedByteCount))
             addLine(lines, depth, ("if %s > %s then"):format(packedNext, payloadLengthVar))
             emitError(lines, depth + 1, validateLevel, label .. " out of bounds", "ERR_BOUNDS")
             addLine(lines, depth, "end")
-            addLine(lines, depth, ("local %s = 1"):format(unpackIndex))
-            addLine(lines, depth, ("for %s = 1, %s do"):format(packedIndex, packedByteCount))
-            addLine(lines, depth + 1, ("local %s = readu8(%s, %s)"):format(packedByte, payloadVar, packedCursor))
-            addLine(lines, depth + 1, ("%s += 1"):format(packedCursor))
-            addLine(lines, depth + 1, ("local %s = 1"):format(bitMask))
-            addLine(lines, depth + 1, ("for %s = 1, 8 do"):format(bitIndex))
-            addLine(lines, depth + 2, ("if %s > %s then"):format(unpackIndex, countVar))
-            addLine(lines, depth + 3, "break")
-            addLine(lines, depth + 2, "end")
-            addLine(lines, depth + 2, ("%s[%s] = band(%s, %s) ~= 0"):format(arrayVar, unpackIndex, packedByte, bitMask))
-            addLine(lines, depth + 2, ("%s += 1"):format(unpackIndex))
-            addLine(lines, depth + 2, ("%s = lshift(%s, 1)"):format(bitMask, bitMask))
-            addLine(lines, depth + 1, "end")
-            addLine(lines, depth, "end")
+            emitReadBoolArray(lines, state, payloadVar, packedCursor, arrayVar, countVar, depth)
             addLine(lines, depth, ("%s = %s"):format(varVar, packedCursor))
         else
             addLine(lines, depth, ("for %s = 1, %s do"):format(indexVar, countVar))
             addLine(lines, depth + 1, ("local %s"):format(valueVar))
-            emitReadForType(lines, state, valueType, valueVar, label .. "[]", payloadVar, payloadLengthVar, varVar, depth + 1, validateLevel, structByName)
+            local elementSize = computeFixedByteSize(valueType, structByName, {})
+            if elementSize ~= nil then
+                emitReadFixedFromBlock(lines, state, valueType, valueVar, label .. "[]", payloadVar, varVar, 0, depth + 1, validateLevel, structByName)
+                addLine(lines, depth + 1, ("%s += %d"):format(varVar, elementSize))
+            else
+                emitReadForType(lines, state, valueType, valueVar, label .. "[]", payloadVar, payloadLengthVar, varVar, depth + 1, validateLevel, structByName)
+            end
             addLine(lines, depth + 1, ("%s[%s] = %s"):format(arrayVar, indexVar, valueVar))
             addLine(lines, depth, "end")
         end
@@ -3434,6 +3474,7 @@ local function emitDecodeCanonicalDataForType(
         local mapVar = nextTemp(state, "mapValues")
         local keyVar = nextTemp(state, "mapKey")
         local valueVar = nextTemp(state, "mapValue")
+        emitDecodeWork(lines, depth, countVar .. " * 2")
         addLine(lines, depth, ("local %s = {}"):format(mapVar))
         addLine(lines, depth, ("for %s = 1, %s do"):format(indexVar, countVar))
         addLine(lines, depth + 1, ("local %s"):format(keyVar))
@@ -3566,6 +3607,7 @@ local function emitSkipCanonicalDataForType(
         if kind == "fixedarray" then
             fixedArraySkipBytes = canSingleAdvanceSkipForFixedType(typeDef, validateLevel, structByName)
         end
+        emitDecodeWork(lines, depth, countVar)
         if fixedArraySkipBytes ~= nil then
             local fixedSkipNext = nextTemp(state, "skipArrayFixedNext")
             addLine(lines, depth, ("local %s = %s + %d"):format(fixedSkipNext, varVar, fixedArraySkipBytes))
@@ -3599,6 +3641,7 @@ local function emitSkipCanonicalDataForType(
         if keyType == nil or valueType == nil then
             error("Map type missing key/value type for canonical skip path")
         end
+        emitDecodeWork(lines, depth, countVar .. " * 2")
         local indexVar = nextTemp(state, "skipMapIndex")
         addLine(lines, depth, ("for %s = 1, %s do"):format(indexVar, countVar))
         emitSkipForType(lines, state, keyType, label .. " key", payloadVar, payloadLengthVar, varVar, depth + 1, validateLevel, structByName)
@@ -3814,6 +3857,9 @@ local function emitFlatSizeForType(
                 addLine(lines, 1, "end")
             end
         end
+        if isValidateBasicOrFull(validateLevel) then
+            emitNumericBounds(lines, 1, typeDef, valueExpr, label, validateLevel)
+        end
         terms[#terms + 1] = tostring(primitiveBytes)
         return
     end
@@ -3835,7 +3881,7 @@ local function emitFlatSizeForType(
         local lenVar = nextTemp(state, "stringLen")
         addLine(lines, 1, ("local %s = #%s"):format(lenVar, valueExpr))
         cacheCollectionHint(stringLenHints, 1, "string", valueExpr, lenVar)
-        if isValidateBasicOrFull(validateLevel) and declaredMax ~= nil then
+        if declaredMax ~= nil then
             addLine(lines, 1, ("if %s > %d then"):format(lenVar, declaredMax))
             emitError(lines, 2, validateLevel, label .. " exceeds max length", "ERR_SCHEMA")
             addLine(lines, 1, "end")
@@ -3863,14 +3909,14 @@ local function emitFlatSizeForType(
                 addLine(lines, 1, ("if type(%s) ~= \"table\" then"):format(valueExpr))
                 emitError(lines, 2, validateLevel, label .. " must be array table", "ERR_TYPE")
                 addLine(lines, 1, "end")
-                local fixedLength = getFixedArrayLength(typeDef)
-                local lenVar = nextTemp(state, "arrayLen")
-                addLine(lines, 1, ("local %s = #%s"):format(lenVar, valueExpr))
-                cacheCollectionHint(stringLenHints, 1, "array", valueExpr, lenVar)
-                addLine(lines, 1, ("if %s ~= %d then"):format(lenVar, fixedLength))
-                emitError(lines, 2, validateLevel, label .. " has invalid fixedarray length", "ERR_SCHEMA")
-                addLine(lines, 1, "end")
             end
+            local fixedLength = getFixedArrayLength(typeDef)
+            local lenVar = nextTemp(state, "arrayLen")
+            addLine(lines, 1, ("local %s = #%s"):format(lenVar, valueExpr))
+            cacheCollectionHint(stringLenHints, 1, "array", valueExpr, lenVar)
+            addLine(lines, 1, ("if %s ~= %d then"):format(lenVar, fixedLength))
+            emitError(lines, 2, validateLevel, label .. " has invalid fixedarray length", "ERR_SCHEMA")
+            addLine(lines, 1, "end")
             terms[#terms + 1] = tostring(fixedSize)
             return
         end
@@ -4034,6 +4080,7 @@ local function emitCodecFunctions(
             end
         end
 
+        addLine(lines, 1, "if totalSize > MaxBatchBytes then error(ERR_BOUNDS) end")
         addLine(lines, 1, "local payload = create(totalSize)")
         addLine(lines, 1, ("%s(payload, 0, %s)"):format(messageIdWidth.writer, messageIdConst))
 
@@ -4074,7 +4121,8 @@ local function emitCodecFunctions(
     end
 
     if includeDecode then
-        addLine(lines, 0, ("local function %s(payload, payloadLength, offset)"):format(decodeName))
+        addLine(lines, 0, ("local function %s(payload, payloadLength, offset, decodeBudget)"):format(decodeName))
+        emitDecodeBudget(lines, params, structByName)
 
         local decodeState: EmitState = { tempIndex = 0 }
         local decodePlans = buildDecodedParamPlans(params, structByName, decodeStructMode)
@@ -4233,7 +4281,8 @@ local function emitSkipFunction(
     local usesCanonicalLayout = paramsHaveVariableLength(params, structByName)
     local canonicalFixedSize = usesCanonicalLayout and fixedBytesForCanonicalParams(params, structByName) or 0
 
-    addLine(lines, 0, ("local function %s(payload, payloadLength, offset)"):format(skipName))
+    addLine(lines, 0, ("local function %s(payload, payloadLength, offset, decodeBudget)"):format(skipName))
+    emitDecodeBudget(lines, params, structByName)
 
     local skipState: EmitState = { tempIndex = 0 }
     if usesCanonicalLayout then

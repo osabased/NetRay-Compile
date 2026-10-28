@@ -274,8 +274,15 @@ end
 local function ensureOutputFolder(): Folder
 	local existing = ReplicatedStorage:FindFirstChild("NetRay")
 	if existing ~= nil and not existing:IsA("Folder") then
-		existing:Destroy()
-		existing = nil
+		error("Output conflict: ReplicatedStorage/NetRay must be a Folder")
+	end
+	if existing ~= nil then
+		for _, name in { "Server", "Client", "Types", "Schema" } do
+			local child = existing:FindFirstChild(name)
+			if child ~= nil and not child:IsA("ModuleScript") then
+				error("Output conflict: ReplicatedStorage/NetRay/" .. name .. " must be a ModuleScript")
+			end
+		end
 	end
 
 	if existing == nil then
@@ -291,8 +298,7 @@ end
 local function upsertModule(parent: Instance, moduleName: string, sourceText: string)
 	local existing = parent:FindFirstChild(moduleName)
 	if existing ~= nil and not existing:IsA("ModuleScript") then
-		existing:Destroy()
-		existing = nil
+		error("Output conflict: " .. moduleName .. " must be a ModuleScript")
 	end
 
 	if existing == nil then

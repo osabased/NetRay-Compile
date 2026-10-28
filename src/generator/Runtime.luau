@@ -1,12 +1,13 @@
 --!strict
 -- Name: Runtime
 -- Purpose: Runtime code generation (queues, listeners, dispatch, preamble)
-local Version = "0.1.1"
+local Version = "0.2.0"
 local Ast = require("../idl/Ast")
 local Analyzer = require("../idl/Analyzer")
 local Types = require("./Types")
 local Utilities = require("./Utilities")
 local Emitters = require("./Emitters")
+local Compression = require("./Compression")
 
 type MessageInfo = Types.MessageInfo
 type EmitState = Types.EmitState
@@ -177,6 +178,10 @@ local function pruneUnusedRuntimeSymbols(lines: { string })
     end
 end
 
+local function limitLiteral(value)
+    return value == 0 and "math.huge" or tostring(value)
+end
+
 local function emitQueue(
     lines: { string },
     prefix: string,
@@ -184,10 +189,11 @@ local function emitQueue(
     fireMethod: string,
     maxPassArgs: number,
     messageIdWidth: WidthInfo,
-    _validateLevel: Analyzer.ValidateLevel
+    _validateLevel: Analyzer.ValidateLevel,
+    compressOutgoing: boolean?
 )
     local upper = string.upper(prefix)
-    addLine(lines, 0, ("local %s_ARENA_CAPACITY = DEFAULT_ARENA_CAPACITY"):format(upper))
+    addLine(lines, 0, ("local %s_ARENA_CAPACITY = 0"):format(upper))
     addLine(lines, 0, ("local %s_ARENA = create(%s_ARENA_CAPACITY)"):format(upper, upper))
     addLine(lines, 0, ("local %s_CURSOR = 0"):format(upper))
     addLine(lines, 0, ("local %s_QUEUE_SIZE = 0"):format(upper))
@@ -198,90 +204,95 @@ local function emitQueue(
             addLine(lines, 0, ("local %s_QUEUE_PASS_%d = table.create(DEFAULT_BATCH_CAPACITY)"):format(upper, passIndex))
         end
     end
-    local segmentHeaderBytes = messageIdWidth.bytes * 2
-    local minSegmentRunCount = math.floor((segmentHeaderBytes + 1) / messageIdWidth.bytes) + 1
-    local minSegmentTailBytes = (minSegmentRunCount - 1) * messageIdWidth.bytes
-    addLine(lines, 0, ("local %s_SEGMENT_HEADER_BYTES = %d"):format(upper, segmentHeaderBytes))
-    addLine(lines, 0, ("local %s_SEGMENT_MIN_COUNT = %d"):format(upper, minSegmentRunCount))
-    addLine(lines, 0, ("local %s_SEGMENT_MIN_TAIL_BYTES = %d"):format(upper, minSegmentTailBytes))
-    addLine(lines, 0, "")
-
-    addLine(lines, 0, ("local function Flush%s()"):format(prefix))
-    addLine(lines, 1, ("if %s_CURSOR == 0 then"):format(upper))
-    addLine(lines, 2, ("%s_QUEUE_SIZE = 0"):format(upper))
-    addLine(lines, 2, "return")
-    addLine(lines, 1, "end")
-    addLine(lines, 1, ("local payloadToSend = create(%s_CURSOR)"):format(upper))
-    addLine(lines, 1, ("local payloadOffset = %s_CURSOR"):format(upper))
-    addLine(lines, 1, ("if %s_QUEUE_SIZE >= %s_SEGMENT_MIN_COUNT then"):format(upper, upper))
-    addLine(lines, 2, "-- Only scan runs when the batch is large enough to amortize segment headers.")
-    addLine(lines, 2, "local sourceOffset = 0")
-    addLine(lines, 2, "payloadOffset = 0")
-    addLine(lines, 2, ("while sourceOffset < %s_CURSOR do"):format(upper))
-    addLine(lines, 3, "local runStart = sourceOffset")
-    addLine(lines, 3, ("local messageId = %s(%s_ARENA, sourceOffset)"):format(messageIdWidth.reader, upper))
-    addLine(lines, 3, ("sourceOffset += %d"):format(messageIdWidth.bytes))
-    addLine(lines, 3, ("local skip = %s_SKIP[messageId]"):format(upper))
-    addLine(lines, 3, ("local firstBodyEnd = skip(%s_ARENA, %s_CURSOR, sourceOffset)"):format(upper, upper))
-    addLine(lines, 3, "local runEnd = firstBodyEnd")
-    addLine(lines, 3, "local runCount = 1")
-    addLine(lines, 3, ("if %s_CURSOR - firstBodyEnd < %s_SEGMENT_MIN_TAIL_BYTES then"):format(upper, upper))
-    addLine(lines, 4, "-- Remaining bytes cannot fit enough repeated IDs to make segmentation pay off.")
-    addLine(lines, 4, ("local tailSize = %s_CURSOR - runStart"):format(upper))
-    addLine(lines, 4, "if tailSize > 0 then")
-    addLine(lines, 5, ("copy(payloadToSend, payloadOffset, %s_ARENA, runStart, tailSize)"):format(upper))
-    addLine(lines, 5, "payloadOffset += tailSize")
-    addLine(lines, 4, "end")
-    addLine(lines, 4, "break")
-    addLine(lines, 3, "end")
-    addLine(lines, 3, ("while runEnd < %s_CURSOR do"):format(upper))
-    addLine(lines, 4, ("local nextMessageId = %s(%s_ARENA, runEnd)"):format(messageIdWidth.reader, upper))
-    addLine(lines, 4, "if nextMessageId ~= messageId then")
-    addLine(lines, 5, "break")
-    addLine(lines, 4, "end")
-    addLine(lines, 4, ("local nextBodyStart = runEnd + %d"):format(messageIdWidth.bytes))
-    addLine(lines, 4, ("runEnd = skip(%s_ARENA, %s_CURSOR, nextBodyStart)"):format(upper, upper))
-    addLine(lines, 4, "runCount += 1")
-    addLine(lines, 3, "end")
-    addLine(lines, 3, ("if runCount * %d > %s_SEGMENT_HEADER_BYTES + VarUIntSize(runCount) then"):format(messageIdWidth.bytes, upper))
-    addLine(lines, 4, ("%s(payloadToSend, payloadOffset, SEGMENT_MARKER_ID)"):format(messageIdWidth.writer))
-    addLine(lines, 4, ("payloadOffset += %d"):format(messageIdWidth.bytes))
-    addLine(lines, 4, ("%s(payloadToSend, payloadOffset, messageId)"):format(messageIdWidth.writer))
-    addLine(lines, 4, ("payloadOffset += %d"):format(messageIdWidth.bytes))
-    addLine(lines, 4, "payloadOffset = WriteVarUInt(payloadToSend, payloadOffset, runCount)")
-    addLine(lines, 4, "local copyCursor = sourceOffset")
-    addLine(lines, 4, "local bodyEnd = firstBodyEnd")
-    addLine(lines, 4, "while true do")
-    addLine(lines, 5, "local bodySize = bodyEnd - copyCursor")
-    addLine(lines, 5, "if bodySize > 0 then")
-    addLine(lines, 6, ("copy(payloadToSend, payloadOffset, %s_ARENA, copyCursor, bodySize)"):format(upper))
-    addLine(lines, 6, "payloadOffset += bodySize")
-    addLine(lines, 5, "end")
-    addLine(lines, 5, "if bodyEnd >= runEnd then")
-    addLine(lines, 6, "break")
-    addLine(lines, 5, "end")
-    addLine(lines, 5, ("copyCursor = bodyEnd + %d"):format(messageIdWidth.bytes))
-    addLine(lines, 5, ("bodyEnd = skip(%s_ARENA, %s_CURSOR, copyCursor)"):format(upper, upper))
-    addLine(lines, 4, "end")
-    addLine(lines, 3, "else")
-    addLine(lines, 4, "local runSize = runEnd - runStart")
-    addLine(lines, 4, "if runSize > 0 then")
-    addLine(lines, 5, ("copy(payloadToSend, payloadOffset, %s_ARENA, runStart, runSize)"):format(upper))
-    addLine(lines, 5, "payloadOffset += runSize")
-    addLine(lines, 4, "end")
-    addLine(lines, 3, "end")
-    addLine(lines, 3, "sourceOffset = runEnd")
-    addLine(lines, 2, "end")
-    addLine(lines, 1, "else")
-    addLine(lines, 2, "-- For tiny batches, a direct copy is cheaper than any merge scan.")
-    addLine(lines, 2, ("copy(payloadToSend, 0, %s_ARENA, 0, %s_CURSOR)"):format(upper, upper))
-    addLine(lines, 1, "end")
-    addLine(lines, 1, ("if payloadOffset < %s_CURSOR then"):format(upper))
-    addLine(lines, 2, "local compactPayload = create(payloadOffset)")
-    addLine(lines, 2, "copy(compactPayload, 0, payloadToSend, 0, payloadOffset)")
-    addLine(lines, 2, "payloadToSend = compactPayload")
-    addLine(lines, 1, "end")
-
+    addLine(lines, 0, ("local %s_ENDS = {}"):format(upper))
+    addLine(lines, 0, ("local %s_IDS = {}"):format(upper))
+    local flushSource = [[
+local function FlushPREFIX()
+    if UPPER_QUEUE_SIZE == 0 then return end
+    PREPARE_COMPRESSION
+    local outputSize = OUTPUT_SIZE
+    local index = 1
+    while index <= UPPER_QUEUE_SIZE do
+        local last = index
+        local messageId = UPPER_IDS[index]
+        while last < UPPER_QUEUE_SIZE and UPPER_IDS[last + 1] == messageId do last += 1 end
+        local count = last - index + 1
+        local savings = count * ID_BYTES - (2 * ID_BYTES + VarUIntSize(count))
+        if savings > 0 then outputSize -= savings end
+        index = last + 1
+    end
+    local payloadToSend = create(outputSize)
+    local outputOffset = 0
+    local sourceOffset = 0
+    index = 1
+    while index <= UPPER_QUEUE_SIZE do
+        local last = index
+        local messageId = UPPER_IDS[index]
+        while last < UPPER_QUEUE_SIZE and UPPER_IDS[last + 1] == messageId do last += 1 end
+        local count = last - index + 1
+        if count * ID_BYTES > 2 * ID_BYTES + VarUIntSize(count) then
+            WRITER(payloadToSend, outputOffset, SEGMENT_MARKER_ID)
+            WRITER(payloadToSend, outputOffset + ID_BYTES, messageId)
+            outputOffset = WriteVarUInt(payloadToSend, outputOffset + 2 * ID_BYTES, count)
+            for bodyIndex = index, last do
+                local bodyStart = sourceOffset + ID_BYTES
+                local bodyEnd = UPPER_ENDS[bodyIndex]
+                local bodySize = bodyEnd - bodyStart
+                COPY_BODY
+                sourceOffset = bodyEnd
+            end
+        else
+            COPY_RUN
+        end
+        index = last + 1
+    end]]
+    flushSource = string.gsub(flushSource, "PREPARE_COMPRESSION", compressOutgoing and [[local compressedBodies = {}
+    -- Each client batch starts a new history so rejected batches cannot desynchronize later ones.
+    local nextState = __nr_cloneCompressionState(nil)
+    local sourceOffset, compressedSize = 0, UPPER_CURSOR
+    for index = 1, UPPER_QUEUE_SIZE do
+        local id = UPPER_IDS[index]
+        local recordEnd = UPPER_ENDS[index]
+        local widths = CompressionWidths[id]
+        if widths ~= nil then
+            local body
+            body, nextState = __nr_compress(nextState, id, UPPER_ARENA, widths or nil, sourceOffset + ID_BYTES, recordEnd - sourceOffset - ID_BYTES)
+            compressedBodies[index] = body
+            compressedSize += len(body) - (recordEnd - sourceOffset - ID_BYTES)
+        end
+        sourceOffset = recordEnd
+    end]] or "")
+    flushSource = string.gsub(flushSource, "OUTPUT_SIZE", compressOutgoing and "compressedSize" or "UPPER_CURSOR")
+    local copyBody = compressOutgoing and [[local body = compressedBodies[bodyIndex]
+                if body then
+                    copy(payloadToSend, outputOffset, body)
+                    outputOffset += len(body)
+                else
+                    copy(payloadToSend, outputOffset, UPPER_ARENA, bodyStart, bodySize)
+                    outputOffset += bodySize
+                end]] or [[copy(payloadToSend, outputOffset, UPPER_ARENA, bodyStart, bodySize)
+                outputOffset += bodySize]]
+    flushSource = string.gsub(flushSource, "COPY_RUN", compressOutgoing and [[for bodyIndex = index, last do
+                WRITER(payloadToSend, outputOffset, messageId)
+                outputOffset += ID_BYTES
+                local bodyStart = sourceOffset + ID_BYTES
+                local bodyEnd = UPPER_ENDS[bodyIndex]
+                local bodySize = bodyEnd - bodyStart
+                COPY_BODY
+                sourceOffset = bodyEnd
+            end]] or [[local runEnd = UPPER_ENDS[last]
+            local runSize = runEnd - sourceOffset
+            copy(payloadToSend, outputOffset, UPPER_ARENA, sourceOffset, runSize)
+            outputOffset += runSize
+            sourceOffset = runEnd]])
+    flushSource = string.gsub(flushSource, "COPY_BODY", copyBody)
+    flushSource = string.gsub(flushSource, "UPPER", upper)
+    flushSource = string.gsub(flushSource, "PREFIX", prefix)
+    flushSource = string.gsub(flushSource, "WRITER", messageIdWidth.writer)
+    flushSource = string.gsub(flushSource, "ID_BYTES", tostring(messageIdWidth.bytes))
+    for _, line in string.split(flushSource, "\n") do
+        lines[#lines + 1] = line
+    end
     if maxPassArgs == 0 then
         addLine(lines, 1, ("%s:%s(payloadToSend)"):format(remoteVar, fireMethod))
     else
@@ -312,6 +323,8 @@ local function emitQueue(
 
     addLine(lines, 1, ("%s_CURSOR = 0"):format(upper))
     addLine(lines, 1, ("%s_QUEUE_SIZE = 0"):format(upper))
+    addLine(lines, 1, ("table.clear(%s_ENDS)"):format(upper))
+    addLine(lines, 1, ("table.clear(%s_IDS)"):format(upper))
     addLine(lines, 0, "end")
     addLine(lines, 0, "")
 end
@@ -328,21 +341,25 @@ local function emitEventListener(
     local upper = string.upper(prefix)
     if isServer then
         if maxPassArgs > 0 then
-            addLine(lines, 0, ("%s.OnServerEvent:Connect(function(player, payload, passCountList, ...)"):format(remoteVar))
+            addLine(lines, 0, ("local function Receive%s(player, payload, passCountList, ...)"):format(prefix))
         else
-            addLine(lines, 0, ("%s.OnServerEvent:Connect(function(player, payload)"):format(remoteVar))
+            addLine(lines, 0, ("local function Receive%s(player, payload)"):format(prefix))
         end
     else
         if maxPassArgs > 0 then
-            addLine(lines, 0, ("%s.OnClientEvent:Connect(function(payload, passCountList, ...)"):format(remoteVar))
+            addLine(lines, 0, ("local function Receive%s(payload, passCountList, ...)"):format(prefix))
         else
-            addLine(lines, 0, ("%s.OnClientEvent:Connect(function(payload)"):format(remoteVar))
+            addLine(lines, 0, ("local function Receive%s(payload)"):format(prefix))
         end
+    end
+    if isServer then
+        addLine(lines, 1, "if not Admit(player, typeof(payload) == \"buffer\" and len(payload) or 0, 0) then return end")
     end
     addLine(lines, 1, "if typeof(payload) ~= \"buffer\" then")
     addLine(lines, 2, "return")
     addLine(lines, 1, "end")
     addLine(lines, 1, "local payloadLength = len(payload)")
+    addLine(lines, 1, ("if payloadLength > %s then return end"):format(prefix == "Unreliable" and "MaxUnreliableBytes" or "MaxBatchBytes"))
     addLine(lines, 1, ("if payloadLength < %d then"):format(messageIdWidth.bytes))
     addLine(lines, 2, "return")
     addLine(lines, 1, "end")
@@ -354,6 +371,10 @@ local function emitEventListener(
         addLine(lines, 1, ("local %s = ..."):format(join(passTables)))
     end
     addLine(lines, 1, "local offset = 0")
+    addLine(lines, 1, "local remainingMessages = MAX_BATCH_MESSAGES")
+    if isServer then
+        addLine(lines, 1, "local decodeBudget = { remaining = MaxDecodeWork }")
+    end
     if maxPassArgs > 0 then
         addLine(lines, 1, "local messageIndex = 0")
     end
@@ -391,6 +412,11 @@ local function emitEventListener(
     addLine(lines, 4, "return")
     addLine(lines, 3, "end")
     addLine(lines, 2, "end")
+    addLine(lines, 2, "if segmentCount > remainingMessages then return end")
+    if isServer then
+        addLine(lines, 2, "if not Admit(player, nil, segmentCount) then return end")
+    end
+    addLine(lines, 2, "remainingMessages -= segmentCount")
     addLine(lines, 2, "for _segmentIndex = 1, segmentCount do")
     if maxPassArgs > 0 then
         addLine(lines, 3, "messageIndex += 1")
@@ -416,6 +442,9 @@ local function emitEventListener(
     callArgs[#callArgs + 1] = "payload"
     callArgs[#callArgs + 1] = "payloadLength"
     callArgs[#callArgs + 1] = "offset"
+    if isServer then
+        callArgs[#callArgs + 1] = "decodeBudget"
+    end
     if maxPassArgs > 0 then
         callArgs[#callArgs + 1] = "passCount"
     end
@@ -423,7 +452,7 @@ local function emitEventListener(
         callArgs[#callArgs + 1] = ("messagePass%d"):format(passIndex)
     end
     addLine(lines, 3, ("local nextOffset = dispatch(%s)"):format(join(callArgs)))
-    if maxPassArgs > 0 or isValidateFull(validateLevel) then
+    do
         addLine(lines, 3, "if type(nextOffset) ~= \"number\" then")
         addLine(lines, 4, "return")
         addLine(lines, 3, "end")
@@ -434,6 +463,10 @@ local function emitEventListener(
     addLine(lines, 3, "offset = nextOffset")
     addLine(lines, 2, "end")
     addLine(lines, 1, "end")
+    addLine(lines, 0, "end")
+    addLine(lines, 0, ("%s.%s:Connect(function(...)"):format(remoteVar, isServer and "OnServerEvent" or "OnClientEvent"))
+    addLine(lines, 1, ("local ok, failure = pcall(Receive%s, ...)"):format(prefix))
+    addLine(lines, 1, "if not ok then ReportError(failure) end")
     addLine(lines, 0, "end)")
     addLine(lines, 0, "")
 end
@@ -450,10 +483,14 @@ local function emitFunctionInvoke(
     else
         addLine(lines, 0, "FunctionRemote.OnClientInvoke = function(payload, ...)")
     end
+    if isServer then
+        addLine(lines, 1, "if not Admit(player, typeof(payload) == \"buffer\" and len(payload) or 0, 1) then error(ERR_BOUNDS) end")
+    end
     addLine(lines, 1, "if typeof(payload) ~= \"buffer\" then")
     emitError(lines, 2, validateLevel, "Function payload must be a buffer", "ERR_TYPE")
     addLine(lines, 1, "end")
     addLine(lines, 1, "local payloadLength = len(payload)")
+    addLine(lines, 1, "if payloadLength > MaxBatchBytes then error(ERR_BOUNDS) end")
     addLine(lines, 1, ("if payloadLength < %d then"):format(messageIdWidth.bytes))
     emitError(lines, 2, validateLevel, "Function payload too short", "ERR_BOUNDS")
     addLine(lines, 1, "end")
@@ -527,7 +564,45 @@ local function emitCommonRuntimePreamble(lines: { string }, schema: Analyzer.Ana
     addLine(lines, 0, "end")
     addLine(lines, 0, "")
     addLine(lines, 0, "local DEFAULT_BATCH_CAPACITY = 2048")
-    addLine(lines, 0, "local DEFAULT_ARENA_CAPACITY = 65536")
+    addLine(lines, 0, ("local MAX_BATCH_MESSAGES = %s"):format(limitLiteral(schema.limits.MaxBatchMessages)))
+    addLine(lines, 0, "local DEFAULT_ARENA_CAPACITY = 256")
+    for _, name in { "MaxBatchBytes", "MaxUnreliableBytes", "MaxPollingMessages", "MaxDecodeWork" } do
+        addLine(lines, 0, ("local %s = %s"):format(name, limitLiteral(schema.limits[name])))
+    end
+    addLine(lines, 0, "local LastErrorTime = -math.huge")
+    addLine(lines, 0, "local function ReportError(message)")
+    addLine(lines, 1, "local now = os.clock()")
+    addLine(lines, 1, "if now - LastErrorTime >= 1 then LastErrorTime = now; warn(message) end")
+    addLine(lines, 0, "end")
+    if isServer then
+        local metrics = { { "calls", "ReceiveCallBurst", "ReceiveCallsPerSecond" }, { "bytes", "ReceiveByteBurst", "ReceiveBytesPerSecond" }, { "messages", "ReceiveMessageBurst", "ReceiveMessagesPerSecond" } }
+        local enabled = false
+        for _, metric in metrics do
+            if schema.limits[metric[2]] > 0 or schema.limits[metric[3]] > 0 then enabled = true end
+        end
+        addLine(lines, 0, "local ReceiveBudgets = setmetatable({}, { __mode = \"k\" })")
+        addLine(lines, 0, "local function Admit(player, byteCost, messageCost)")
+        if enabled then
+            addLine(lines, 1, "local now = os.clock()")
+            addLine(lines, 1, "local state = ReceiveBudgets[player]")
+            addLine(lines, 1, "if state == nil then state = { time = now }; ReceiveBudgets[player] = state end")
+            addLine(lines, 1, "local elapsed = math.max(0, now - state.time)")
+            addLine(lines, 1, "state.time = now")
+            for _, metric in metrics do
+                local burst, rate = schema.limits[metric[2]], schema.limits[metric[3]]
+                if burst > 0 or rate > 0 then
+                    if burst == 0 then burst = rate end
+                    if rate == 0 then rate = burst end
+                    addLine(lines, 1, ("state.%s = math.min(%s, (state.%s or %s) + elapsed * %s)"):format(metric[1], burst, metric[1], burst, rate))
+                    local cost = metric[1] == "calls" and "(byteCost ~= nil and 1 or 0)" or (metric[1] == "bytes" and "(byteCost or 0)" or "messageCost")
+                    addLine(lines, 1, ("if state.%s < %s then return false end"):format(metric[1], cost))
+                    addLine(lines, 1, ("state.%s -= %s"):format(metric[1], cost))
+                end
+            end
+        end
+        addLine(lines, 1, "return true")
+        addLine(lines, 0, "end")
+    end
     addLine(lines, 0, "local create = buffer.create")
     addLine(lines, 0, "local copy = buffer.copy")
     addLine(lines, 0, "local len = buffer.len")
@@ -539,7 +614,7 @@ local function emitCommonRuntimePreamble(lines: { string }, schema: Analyzer.Ana
     addLine(lines, 0, "local writei32 = buffer.writei32")
     addLine(lines, 0, "local function writef16(payload, offset, value)")
     addLine(lines, 1, "local sign = 0")
-    addLine(lines, 1, "if value < 0 or value == -math.huge then")
+    addLine(lines, 1, "if value < 0 or (value == 0 and 1 / value < 0) then")
     addLine(lines, 2, "sign = 32768")
     addLine(lines, 2, "value = -value")
     addLine(lines, 1, "end")
@@ -555,14 +630,16 @@ local function emitCommonRuntimePreamble(lines: { string }, schema: Analyzer.Ana
     addLine(lines, 2, "writeu16(payload, offset, sign)")
     addLine(lines, 2, "return")
     addLine(lines, 1, "end")
-    addLine(lines, 1, "local exp = math.floor(math.log(value, 2))")
-    addLine(lines, 1, "local mant = value / (2 ^ exp) - 1")
+    addLine(lines, 1, "local fraction, exponent = math.frexp(value)")
+    addLine(lines, 1, "local exp = exponent - 1")
+    addLine(lines, 1, "local mant = fraction * 2 - 1")
     addLine(lines, 1, "local halfExp = exp + 15")
     addLine(lines, 1, "local halfMant")
     addLine(lines, 1, "if halfExp <= 0 then")
-    addLine(lines, 2, "halfMant = math.floor(value / (2 ^ -24) +0.5)")
-    addLine(lines, 2, "if halfMant < 0 then halfMant = 0 end")
-    addLine(lines, 2, "if halfMant > 1023 then halfMant = 1023 end")
+    addLine(lines, 2, "local scaled = value / (2 ^ -24)")
+    addLine(lines, 2, "halfMant = math.floor(scaled)")
+    addLine(lines, 2, "local remainder = scaled - halfMant")
+    addLine(lines, 2, "if remainder > 0.5 or (remainder == 0.5 and halfMant % 2 ~= 0) then halfMant += 1 end")
     addLine(lines, 2, "writeu16(payload, offset, sign + halfMant)")
     addLine(lines, 2, "return")
     addLine(lines, 1, "end")
@@ -570,7 +647,10 @@ local function emitCommonRuntimePreamble(lines: { string }, schema: Analyzer.Ana
     addLine(lines, 2, "writeu16(payload, offset, sign + 31744)")
     addLine(lines, 2, "return")
     addLine(lines, 1, "end")
-    addLine(lines, 1, "halfMant = math.floor(mant * 1024 +0.5)")
+    addLine(lines, 1, "local scaled = mant * 1024")
+    addLine(lines, 1, "halfMant = math.floor(scaled)")
+    addLine(lines, 1, "local remainder = scaled - halfMant")
+    addLine(lines, 1, "if remainder > 0.5 or (remainder == 0.5 and halfMant % 2 ~= 0) then halfMant += 1 end")
     addLine(lines, 1, "if halfMant >= 1024 then")
     addLine(lines, 2, "halfMant = 0")
     addLine(lines, 2, "halfExp += 1")
@@ -765,6 +845,7 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
     local maxReliableId = 0
     local maxUnreliableId = 0
     local maxFunctionId = 0
+    addLine(lines, 0, "local APIs = {}")
     for index = 1, #messages do
         local info = messages[index]
         local category = info.message.category
@@ -797,6 +878,27 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
     addLine(lines, 0, "local FUNCTION_DISPATCH = table.create(MAX_FUNCTION_ID)")
     addLine(lines, 0, "")
 
+    local hasCompression = false
+    for _, info in messages do if info.message.compression ~= nil then hasCompression = true end end
+    if hasCompression then
+        Compression.emit(lines)
+        addLine(lines, 0, "local CompressionWidths = {}")
+        if not isServer then addLine(lines, 0, "local ReceiveCompression = nil") end
+        for _, info in messages do
+            if info.message.compression ~= nil then
+                local widths = {}
+                if info.message.compression == "Fields" then
+                    for _, param in info.serializedParams do
+                        local width = Utilities.computeFixedByteSize(param.type, schema.structByName, {})
+                        if width == nil then error("Field compression requires fixed serialized fields") end
+                        widths[#widths + 1] = tostring(width)
+                    end
+                end
+                addLine(lines, 0, ("CompressionWidths[%d] = %s"):format(info.message.id, info.message.compression == "Fields" and ("{" .. table.concat(widths, ", ") .. "}") or "false"))
+            end
+        end
+    end
+
     emitQueue(
         lines,
         "Reliable",
@@ -804,7 +906,8 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
         isServer and "FireAllClients" or "FireServer",
         schema.maxPassArgs.reliable,
         reliableMessageIdWidth,
-        validateLevel
+        validateLevel,
+        hasCompression and not isServer
     )
     emitQueue(
         lines,
@@ -815,6 +918,95 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
         unreliableMessageIdWidth,
         validateLevel
     )
+
+
+    if isServer then
+        local targetedSource = [[
+local Targeted = {}
+local TargetedBytes = 0
+local TargetedCount = 0
+COMPRESSION_DECL
+local function FlushTargeted()
+    local pending = Targeted
+    Targeted = {}
+    TargetedBytes, TargetedCount = 0, 0
+    for player, queue in pending do
+        local records = {}
+        local outputBytes = 0
+        COMPRESSION_STATE
+        for index = 1, #queue do
+            local record = queue[index][1]
+            COMPRESSION_RECORD
+            records[index] = record
+            outputBytes += len(record)
+        end
+        local payload = create(outputBytes)
+        local offset = 0
+        local passCounts = {}
+        local passLists = table.create(MAX_PASS)
+        for passIndex = 1, MAX_PASS do passLists[passIndex] = {} end
+        for index = 1, #queue do
+            local message = queue[index]
+            local bytes = len(records[index])
+            copy(payload, offset, records[index], 0, bytes)
+            offset += bytes
+            passCounts[index] = message[2] and message[2][1] or 0
+            for passIndex = 1, MAX_PASS do
+                local values = message[passIndex + 2]
+                passLists[passIndex][index] = values and values[1]
+            end
+        end
+        local ok, failure
+        if MAX_PASS == 0 then
+            ok, failure = pcall(Reliable.FireClient, Reliable, player, payload)
+        else
+            ok, failure = pcall(Reliable.FireClient, Reliable, player, payload, passCounts, table.unpack(passLists, 1, MAX_PASS))
+        end
+        if ok then
+            COMPRESSION_COMMIT
+        else
+            RELIABLE_DROPPED += #queue
+            ReportError(failure)
+        end
+    end
+end
+local function QueueTarget(player, payload, ...)
+    FlushReliable()
+    local bytes = len(payload) COMPRESSION_RESERVE
+    if bytes > MaxBatchBytes then RELIABLE_DROPPED += 1; ReportError("NetRay outgoing message exceeds byte limit"); return false end
+    if TargetedBytes + bytes > MaxBatchBytes or TargetedCount >= MAX_BATCH_MESSAGES then FlushTargeted() end
+    local queue = Targeted[player]
+    if queue == nil then queue = { bytes = 0 }; Targeted[player] = queue end
+    queue[#queue + 1] = { payload, ... }
+    queue.bytes += bytes
+    TargetedBytes += bytes
+    TargetedCount += 1
+    return true
+end
+Players.PlayerRemoving:Connect(function(player)
+    local queue = Targeted[player]
+    if queue then TargetedBytes -= queue.bytes; TargetedCount -= #queue; Targeted[player] = nil end
+    COMPRESSION_REMOVE
+end)
+]]
+        targetedSource = string.gsub(targetedSource, "MAX_PASS", tostring(schema.maxPassArgs.reliable))
+        targetedSource = string.gsub(targetedSource, "COMPRESSION_DECL", hasCompression and 'local TargetCompression = setmetatable({}, { __mode = "k" })' or "")
+        targetedSource = string.gsub(targetedSource, "COMPRESSION_STATE", hasCompression and "local nextState = __nr_cloneCompressionState(TargetCompression[player])" or "")
+        targetedSource = string.gsub(targetedSource, "COMPRESSION_RECORD", hasCompression and ([[local id = %s(record, 0)
+            local widths = CompressionWidths[id]
+            if widths ~= nil then
+                local encoded
+                encoded, nextState = __nr_compress(nextState, id, record, widths or nil, %d)
+                local framed = create(%d + len(encoded))
+                %s(framed, 0, id)
+                copy(framed, %d, encoded, 0, len(encoded))
+                record = framed
+            end]]):format(reliableMessageIdWidth.reader, reliableMessageIdWidth.bytes, reliableMessageIdWidth.bytes, reliableMessageIdWidth.writer, reliableMessageIdWidth.bytes) or "")
+        targetedSource = string.gsub(targetedSource, "COMPRESSION_COMMIT", hasCompression and "TargetCompression[player] = nextState" or "")
+        targetedSource = string.gsub(targetedSource, "COMPRESSION_RESERVE", hasCompression and ("+ (CompressionWidths[%s(payload, 0)] ~= nil and 1 or 0)"):format(reliableMessageIdWidth.reader) or "")
+        targetedSource = string.gsub(targetedSource, "COMPRESSION_REMOVE", hasCompression and "TargetCompression[player] = nil" or "")
+        for _, line in string.split(targetedSource, "\n") do lines[#lines + 1] = line end
+    end
 
     for index = 1, #messages do
         local info = messages[index]
@@ -847,6 +1039,7 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
         local requestDecodePlans = buildDecodedParamPlans(info.serializedParams, schema.structByName, decodeStructMode)
         local requestDecodedVars = collectDecodedLeafNames(requestDecodePlans)
 
+        addLine(lines, 0, "do")
         addLine(lines, 0, ("local %s: %s = {} :: %s"):format(symbol, apiTypeName, apiTypeName))
         addLine(lines, 0, ("local %s = %d"):format(messageIdConst, message.id))
         addLine(lines, 0, "")
@@ -905,7 +1098,7 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
             local serializedNames = paramNames(info.serializedParams)
             local passthroughNames = paramNames(info.passthroughParams)
             local queueUpper = message.category == "unreliable" and "UNRELIABLE" or "RELIABLE"
-            local remoteVarName = message.category == "unreliable" and "Unreliable" or "Reliable"
+            local targetCall = message.category == "unreliable" and "Unreliable:FireClient" or "QueueTarget"
             local categoryMaxPass = schema.maxPassArgs[message.category]
             local eventCallbackType = callbackTypeName
             local usesCanonicalLayout = paramsHaveVariableLength(info.serializedParams, schema.structByName)
@@ -920,10 +1113,8 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
             local eventIsAsync = eventCall == "SingleAsync" or eventCall == "ManyAsync"
             local eventIsPolling = eventCall == "Polling"
             local handlerListName = "Handlers_" .. symbol
-            local handlerTokenListName = "HandlerTokens_" .. symbol
-            local handlerSlotByTokenName = "HandlerSlotByToken_" .. symbol
+            local handlerFreeSlotsName = "HandlerFreeSlots_" .. symbol
             local handlerCountName = "HandlerCount_" .. symbol
-            local handlerNextTokenName = "HandlerNextToken_" .. symbol
 
             local callbackArgs: { string } = {}
             if isServer then
@@ -949,6 +1140,9 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
             local pollingHeadName = "PollHead_" .. symbol
             local pollingTailName = "PollTail_" .. symbol
             local pollingArgNames: { string } = {}
+            if canEmitOn and isServer and message.rate ~= nil then
+                addLine(lines, 0, 'local EventBudgets = setmetatable({}, { __mode = "k" })')
+            end
             if canEmitOn and eventIsPolling then
                 addLine(lines, 0, ("local %s = 1"):format(pollingHeadName))
                 addLine(lines, 0, ("local %s = 0"):format(pollingTailName))
@@ -961,15 +1155,13 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
             end
 
             if canEmitOn and eventIsMany then
-                addLine(lines, 0, ("local %s = table.create(DEFAULT_BATCH_CAPACITY)"):format(handlerListName))
-                addLine(lines, 0, ("local %s = table.create(DEFAULT_BATCH_CAPACITY)"):format(handlerTokenListName))
-                addLine(lines, 0, ("local %s = {}"):format(handlerSlotByTokenName))
+                addLine(lines, 0, ("local %s = {}"):format(handlerListName))
+                addLine(lines, 0, ("local %s = {}"):format(handlerFreeSlotsName))
                 addLine(lines, 0, ("local %s = 0"):format(handlerCountName))
-                addLine(lines, 0, ("local %s = 0"):format(handlerNextTokenName))
                 addLine(lines, 0, "")
             end
 
-            if canEmitFire then
+            if canEmitFire or (canEmitOn and (message.max ~= nil or (isServer and message.rate ~= nil))) then
                 emitSkipFunction(lines, skipName, info.serializedParams, info.fullName, validateLevel, schema.structByName)
                 local skipDispatchVar = message.category == "unreliable" and "UNRELIABLE_SKIP" or "RELIABLE_SKIP"
                 addLine(lines, 0, ("%s[%d] = %s"):format(skipDispatchVar, message.id, skipName))
@@ -978,6 +1170,9 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
 
             if canEmitFire then
                 addLine(lines, 0, ("function %s.%s(%s): boolean"):format(symbol, methodName, allParamSignature))
+                if isServer and message.compression ~= nil then
+                    addLine(lines, 1, ("return %s.FireList(Players:GetPlayers()%s%s)"):format(symbol, #message.params > 0 and ", " or "", join(paramNames(message.params))))
+                else
                 if requestNeedsPassValidation then
                     addLine(
                         lines,
@@ -1057,13 +1252,23 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
                     end
                 end
 
+                local byteLimit = message.category == "unreliable" and "MaxUnreliableBytes" or "MaxBatchBytes"
+                local compressionReserve = not isServer and message.compression ~= nil and 1 or 0
+                addLine(lines, 1, ("if __nr_totalSize > %s then %s_DROPPED += 1; ReportError(\"NetRay outgoing message exceeds byte limit\"); return false end"):format(compressionReserve == 1 and "(MaxBatchBytes - 1)" or byteLimit, queueUpper))
+                if message.max ~= nil then
+                    addLine(lines, 1, ("if __nr_totalSize - %d > %d then %s_DROPPED += 1; ReportError(%q); return false end"):format(messageIdWidth.bytes, message.max, queueUpper, info.fullName .. " exceeds max body bytes"))
+                end
+                if isServer and message.category == "reliable" then addLine(lines, 1, "FlushTargeted()") end
+                local batchReserve = hasCompression and not isServer and message.category == "reliable" and " + RELIABLE_QUEUE_SIZE + 1" or ""
+                addLine(lines, 1, ("if %s_QUEUE_SIZE >= MAX_BATCH_MESSAGES or %s_CURSOR + __nr_totalSize%s > %s then Flush%s() end"):format(queueUpper, queueUpper, batchReserve, byteLimit, message.category == "unreliable" and "Unreliable" or "Reliable"))
                 addLine(lines, 1, ("local __nr_base = %s_CURSOR"):format(queueUpper))
                 addLine(lines, 1, "local __nr_required = __nr_base + __nr_totalSize")
                 addLine(lines, 1, ("if __nr_required > %s_ARENA_CAPACITY then"):format(queueUpper))
-                addLine(lines, 2, ("local nextCapacity = %s_ARENA_CAPACITY"):format(queueUpper))
+                addLine(lines, 2, ("local nextCapacity = math.max(DEFAULT_ARENA_CAPACITY, %s_ARENA_CAPACITY)"):format(queueUpper))
                 addLine(lines, 2, "while nextCapacity < __nr_required do")
                 addLine(lines, 3, "nextCapacity *= 2")
                 addLine(lines, 2, "end")
+                addLine(lines, 2, ("nextCapacity = math.min(nextCapacity, %s)"):format(byteLimit))
                 addLine(lines, 2, "local nextArena = create(nextCapacity)")
                 addLine(lines, 2, ("if %s_CURSOR > 0 then"):format(queueUpper))
                 addLine(lines, 3, ("copy(nextArena, 0, %s_ARENA, 0, %s_CURSOR)"):format(queueUpper, queueUpper))
@@ -1072,7 +1277,6 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
                 addLine(lines, 2, ("%s_ARENA_CAPACITY = nextCapacity"):format(queueUpper))
                 addLine(lines, 1, "end")
 
-                addLine(lines, 1, ("%s_CURSOR = __nr_required"):format(queueUpper))
                 addLine(lines, 1, ("local __nr_payload = %s_ARENA"):format(queueUpper))
                 addLine(lines, 1, ("%s(__nr_payload, __nr_base, %s)"):format(messageIdWidth.writer, messageIdConst))
                 local fireWriteState: EmitState = { tempIndex = fireSizeState.tempIndex }
@@ -1114,7 +1318,10 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
                         fireStringLenHints
                     )
                 end
+                addLine(lines, 1, ("%s_CURSOR = __nr_required"):format(queueUpper))
                 addLine(lines, 1, ("%s_QUEUE_SIZE += 1"):format(queueUpper))
+                addLine(lines, 1, ("%s_ENDS[%s_QUEUE_SIZE] = __nr_required"):format(queueUpper, queueUpper))
+                addLine(lines, 1, ("%s_IDS[%s_QUEUE_SIZE] = %s"):format(queueUpper, queueUpper, messageIdConst))
                 if categoryMaxPass > 0 then
                     addLine(lines, 1, ("local __nr_slot = %s_QUEUE_SIZE"):format(queueUpper))
                     addLine(lines, 1, ("%s_QUEUE_PASS_COUNT[__nr_slot] = %d"):format(queueUpper, #info.passthroughParams))
@@ -1124,6 +1331,7 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
                     end
                 end
                 addLine(lines, 1, "return true")
+                end
                 addLine(lines, 0, "end")
                 addLine(lines, 0, "")
             end
@@ -1159,6 +1367,11 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
                     addLine(lines, 1, "end")
                 end
                 addLine(lines, 1, ("local __nr_payload = %s(%s)"):format(encodeRequestName, join(serializedNames)))
+                local targetLimit = message.category == "unreliable" and "MaxUnreliableBytes" or (message.compression ~= nil and "(MaxBatchBytes - 1)" or "MaxBatchBytes")
+                addLine(lines, 1, ("if len(__nr_payload) > %s then %s_DROPPED += 1; return false end"):format(targetLimit, queueUpper))
+                if message.max ~= nil then
+                    addLine(lines, 1, ("if len(__nr_payload) - %d > %d then %s_DROPPED += 1; return false end"):format(messageIdWidth.bytes, message.max, queueUpper))
+                end
                 if categoryMaxPass > 0 then
                     addLine(lines, 1, ("local __nr_passCountList = table.create(1, %d)"):format(#info.passthroughParams))
                     local firePassArgs: { string } = { "player", "__nr_payload", "__nr_passCountList" }
@@ -1169,9 +1382,9 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
                         addLine(lines, 1, ("%s[1] = %s"):format(passListName, passValueExpr))
                         firePassArgs[#firePassArgs + 1] = passListName
                     end
-                    addLine(lines, 1, ("%s:FireClient(%s)"):format(remoteVarName, join(firePassArgs)))
+                    addLine(lines, 1, ("%s(%s)"):format(targetCall, join(firePassArgs)))
                 else
-                    addLine(lines, 1, ("%s:FireClient(player, __nr_payload)"):format(remoteVarName))
+                    addLine(lines, 1, ("%s(player, __nr_payload)"):format(targetCall))
                 end
                 addLine(lines, 1, "return true")
                 addLine(lines, 0, "end")
@@ -1196,6 +1409,11 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
                     addLine(lines, 1, "end")
                 end
                 addLine(lines, 1, ("local __nr_payload = %s(%s)"):format(encodeRequestName, join(serializedNames)))
+                local targetLimit = message.category == "unreliable" and "MaxUnreliableBytes" or (message.compression ~= nil and "(MaxBatchBytes - 1)" or "MaxBatchBytes")
+                addLine(lines, 1, ("if len(__nr_payload) > %s then %s_DROPPED += 1; return false end"):format(targetLimit, queueUpper))
+                if message.max ~= nil then
+                    addLine(lines, 1, ("if len(__nr_payload) - %d > %d then %s_DROPPED += 1; return false end"):format(messageIdWidth.bytes, message.max, queueUpper))
+                end
                 if categoryMaxPass > 0 then
                     addLine(lines, 1, ("local __nr_passCountList = table.create(1, %d)"):format(#info.passthroughParams))
                     local fireListPassArgs: { string } = { "__nr_target", "__nr_payload", "__nr_passCountList" }
@@ -1211,7 +1429,7 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
                     addLine(lines, 2, "if typeof(__nr_target) ~= \"Instance\" or not __nr_target:IsA(\"Player\") then")
                     emitError(lines, 3, validateLevel, info.fullName .. " FireList requires Player values", "ERR_TYPE")
                     addLine(lines, 2, "end")
-                    addLine(lines, 2, ("%s:FireClient(%s)"):format(remoteVarName, join(fireListPassArgs)))
+                    addLine(lines, 2, ("%s(%s)"):format(targetCall, join(fireListPassArgs)))
                     addLine(lines, 1, "end")
                 else
                     addLine(lines, 1, "for __nr_index = 1, #players do")
@@ -1219,7 +1437,7 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
                     addLine(lines, 2, "if typeof(__nr_target) ~= \"Instance\" or not __nr_target:IsA(\"Player\") then")
                     emitError(lines, 3, validateLevel, info.fullName .. " FireList requires Player values", "ERR_TYPE")
                     addLine(lines, 2, "end")
-                    addLine(lines, 2, ("%s:FireClient(__nr_target, __nr_payload)"):format(remoteVarName))
+                    addLine(lines, 2, ("%s(__nr_target, __nr_payload)"):format(targetCall))
                     addLine(lines, 1, "end")
                 end
                 addLine(lines, 1, "return true")
@@ -1245,6 +1463,11 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
                     addLine(lines, 1, "end")
                 end
                 addLine(lines, 1, ("local __nr_payload = %s(%s)"):format(encodeRequestName, join(serializedNames)))
+                local targetLimit = message.category == "unreliable" and "MaxUnreliableBytes" or (message.compression ~= nil and "(MaxBatchBytes - 1)" or "MaxBatchBytes")
+                addLine(lines, 1, ("if len(__nr_payload) > %s then %s_DROPPED += 1; return false end"):format(targetLimit, queueUpper))
+                if message.max ~= nil then
+                    addLine(lines, 1, ("if len(__nr_payload) - %d > %d then %s_DROPPED += 1; return false end"):format(messageIdWidth.bytes, message.max, queueUpper))
+                end
                 addLine(lines, 1, "local __nr_players = Players:GetPlayers()")
                 if categoryMaxPass > 0 then
                     addLine(lines, 1, ("local __nr_passCountList = table.create(1, %d)"):format(#info.passthroughParams))
@@ -1259,14 +1482,14 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
                     addLine(lines, 1, "for __nr_index = 1, #__nr_players do")
                     addLine(lines, 2, "local __nr_target = __nr_players[__nr_index]")
                     addLine(lines, 2, "if __nr_target ~= excludedPlayer then")
-                    addLine(lines, 3, ("%s:FireClient(%s)"):format(remoteVarName, join(fireExceptPassArgs)))
+                    addLine(lines, 3, ("%s(%s)"):format(targetCall, join(fireExceptPassArgs)))
                     addLine(lines, 2, "end")
                     addLine(lines, 1, "end")
                 else
                     addLine(lines, 1, "for __nr_index = 1, #__nr_players do")
                     addLine(lines, 2, "local __nr_target = __nr_players[__nr_index]")
                     addLine(lines, 2, "if __nr_target ~= excludedPlayer then")
-                    addLine(lines, 3, ("%s:FireClient(__nr_target, __nr_payload)"):format(remoteVarName))
+                    addLine(lines, 3, ("%s(__nr_target, __nr_payload)"):format(targetCall))
                     addLine(lines, 2, "end")
                     addLine(lines, 1, "end")
                 end
@@ -1283,12 +1506,13 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
                     addLine(lines, 2, ("if __nr_head > %s then"):format(pollingTailName))
                     addLine(lines, 3, "return nil")
                     addLine(lines, 2, "end")
+                    addLine(lines, 2, schema.limits.MaxPollingMessages == 0 and "local __nr_slot = __nr_head" or "local __nr_slot = (__nr_head - 1) % MaxPollingMessages + 1")
                     local pollReturnVars: { string } = {}
                     for argIndex = 1, #pollingArgNames do
                         local pollVarName = ("__nr_arg%d"):format(argIndex)
                         pollReturnVars[#pollReturnVars + 1] = pollVarName
-                        addLine(lines, 2, ("local %s = %s[__nr_head]"):format(pollVarName, pollingArgNames[argIndex]))
-                        addLine(lines, 2, ("%s[__nr_head] = nil"):format(pollingArgNames[argIndex]))
+                        addLine(lines, 2, ("local %s = %s[__nr_slot]"):format(pollVarName, pollingArgNames[argIndex]))
+                        addLine(lines, 2, ("%s[__nr_slot] = nil"):format(pollingArgNames[argIndex]))
                     end
                     addLine(lines, 2, ("%s = __nr_head + 1"):format(pollingHeadName))
                     addLine(lines, 2, ("if %s > %s then"):format(pollingHeadName, pollingTailName))
@@ -1296,9 +1520,9 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
                     addLine(lines, 3, ("%s = 0"):format(pollingTailName))
                     addLine(lines, 2, "end")
                     if #pollReturnVars > 0 then
-                        addLine(lines, 2, ("return %s"):format(join(pollReturnVars)))
+                        addLine(lines, 2, ("return __nr_head, %s"):format(join(pollReturnVars)))
                     else
-                        addLine(lines, 2, "return true")
+                        addLine(lines, 2, "return __nr_head")
                     end
                     addLine(lines, 1, "end")
                     addLine(lines, 0, "end")
@@ -1320,32 +1544,28 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
                 elseif eventIsMany then
                     addLine(lines, 0, ("function %s.On(callback: %s): Connection"):format(symbol, eventCallbackType))
                     addLine(lines, 1, "if type(callback) ~= \"function\" then error(ERR_TYPE) end")
-                    addLine(lines, 1, ("%s += 1"):format(handlerNextTokenName))
-                    addLine(lines, 1, ("local token = %s"):format(handlerNextTokenName))
-                    addLine(lines, 1, ("%s += 1"):format(handlerCountName))
-                    addLine(lines, 1, ("local slot = %s"):format(handlerCountName))
+                    addLine(lines, 1, ("local slot = %s[#%s]"):format(handlerFreeSlotsName, handlerFreeSlotsName))
+                    addLine(lines, 1, ("while slot ~= nil and slot > %s do"):format(handlerCountName))
+                    addLine(lines, 2, ("%s[#%s] = nil"):format(handlerFreeSlotsName, handlerFreeSlotsName))
+                    addLine(lines, 2, ("slot = %s[#%s]"):format(handlerFreeSlotsName, handlerFreeSlotsName))
+                    addLine(lines, 1, "end")
+                    addLine(lines, 1, "if slot == nil then")
+                    addLine(lines, 2, ("%s += 1"):format(handlerCountName))
+                    addLine(lines, 2, ("slot = %s"):format(handlerCountName))
+                    addLine(lines, 1, "else")
+                    addLine(lines, 2, ("%s[#%s] = nil"):format(handlerFreeSlotsName, handlerFreeSlotsName))
+                    addLine(lines, 1, "end")
                     addLine(lines, 1, ("%s[slot] = callback"):format(handlerListName))
-                    addLine(lines, 1, ("%s[slot] = token"):format(handlerTokenListName))
-                    addLine(lines, 1, ("%s[token] = slot"):format(handlerSlotByTokenName))
                     addLine(lines, 1, "return CreateConnection(function()")
-                    addLine(lines, 2, ("local existingSlot = %s[token]"):format(handlerSlotByTokenName))
-                    addLine(lines, 2, "if existingSlot == nil then")
-                    addLine(lines, 3, "return")
-                    addLine(lines, 2, "end")
-                    addLine(lines, 2, ("local lastSlot = %s"):format(handlerCountName))
-                    addLine(lines, 2, "if existingSlot ~= lastSlot then")
-                    addLine(lines, 3, ("local movedCallback = %s[lastSlot]"):format(handlerListName))
-                    addLine(lines, 3, ("local movedToken = %s[lastSlot]"):format(handlerTokenListName))
-                    addLine(lines, 3, ("%s[existingSlot] = movedCallback"):format(handlerListName))
-                    addLine(lines, 3, ("%s[existingSlot] = movedToken"):format(handlerTokenListName))
-                    addLine(lines, 3, "if movedToken ~= nil then")
-                    addLine(lines, 4, ("%s[movedToken] = existingSlot"):format(handlerSlotByTokenName))
+                    addLine(lines, 2, "-- Stable slots keep disconnection safe during dispatch; On reuses holes.")
+                    addLine(lines, 2, ("%s[slot] = nil"):format(handlerListName))
+                    addLine(lines, 2, ("if slot == %s then"):format(handlerCountName))
+                    addLine(lines, 3, ("while %s > 0 and %s[%s] == nil do"):format(handlerCountName, handlerListName, handlerCountName))
+                    addLine(lines, 4, ("%s -= 1"):format(handlerCountName))
                     addLine(lines, 3, "end")
+                    addLine(lines, 2, "else")
+                    addLine(lines, 3, ("%s[#%s + 1] = slot"):format(handlerFreeSlotsName, handlerFreeSlotsName))
                     addLine(lines, 2, "end")
-                    addLine(lines, 2, ("%s[lastSlot] = nil"):format(handlerListName))
-                    addLine(lines, 2, ("%s[lastSlot] = nil"):format(handlerTokenListName))
-                    addLine(lines, 2, ("%s[token] = nil"):format(handlerSlotByTokenName))
-                    addLine(lines, 2, ("%s -= 1"):format(handlerCountName))
                     addLine(lines, 1, "end)")
                     addLine(lines, 0, "end")
                     addLine(lines, 0, "")
@@ -1361,6 +1581,9 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
                 signatureArgs[#signatureArgs + 1] = "payload"
                 signatureArgs[#signatureArgs + 1] = "payloadLength"
                 signatureArgs[#signatureArgs + 1] = "offset"
+                if isServer then
+                    signatureArgs[#signatureArgs + 1] = "decodeBudget"
+                end
                 if categoryMaxPass > 0 then
                     signatureArgs[#signatureArgs + 1] = "passCount"
                 end
@@ -1369,6 +1592,20 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
                 end
 
                 addLine(lines, 0, ("%s[%d] = function(%s)"):format(dispatchVar, message.id, join(signatureArgs)))
+                local decodeBudgetArg = if isServer then ", decodeBudget" else ""
+                if message.max ~= nil and message.compression == nil then
+                    addLine(lines, 1, ("local bodyEnd = %s(payload, payloadLength, offset%s)"):format(skipName, decodeBudgetArg))
+                    addLine(lines, 1, ("if bodyEnd - offset > %d then return bodyEnd end"):format(message.max))
+                end
+                if isServer and message.rate ~= nil and message.compression == nil then
+                    addLine(lines, 1, "local now = os.clock()")
+                    addLine(lines, 1, "local budget = EventBudgets[player]")
+                    addLine(lines, 1, ("if budget == nil then budget = { time = now, tokens = %s }; EventBudgets[player] = budget end"):format(tostring(message.burst)))
+                    addLine(lines, 1, ("budget.tokens = math.min(%s, budget.tokens + math.max(0, now - budget.time) * %s)"):format(tostring(message.burst), tostring(message.rate)))
+                    addLine(lines, 1, "budget.time = now")
+                    addLine(lines, 1, ("if budget.tokens < 1 then return %s(payload, payloadLength, offset%s) end"):format(skipName, decodeBudgetArg))
+                    addLine(lines, 1, "budget.tokens -= 1")
+                end
                 if requestNeedsPassValidation then
                     local passVarsForValidation: { string } = { "passCount" }
                     for passIndex = 1, #info.passthroughParams do
@@ -1384,13 +1621,52 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
                     decodeResultVars[#decodeResultVars + 1] = requestDecodedVars[idxVar]
                 end
                 decodeResultVars[#decodeResultVars + 1] = "nextOffset"
-                addLine(lines, 1, ("local %s = %s(payload, payloadLength, offset)"):format(join(decodeResultVars), decodeRequestName))
+                if message.compression ~= nil then
+                    if isServer then addLine(lines, 1, "local ReceiveCompression = decodeBudget.compression") end
+                    addLine(lines, 1, "if offset >= payloadLength then error(ERR_BOUNDS) end")
+                    addLine(lines, 1, "local mode = readu8(payload, offset)")
+                    addLine(lines, 1, ("local %s"):format(join(decodeResultVars)))
+                    addLine(lines, 1, "if mode == 0 or mode == 3 then")
+                    if message.max ~= nil then
+                        addLine(lines, 2, ("local bodyEnd = %s(payload, payloadLength, offset + 1%s)"):format(skipName, decodeBudgetArg))
+                        addLine(lines, 2, ("if bodyEnd - offset - 1 > %d then error(ERR_BOUNDS) end"):format(message.max))
+                    end
+                    addLine(lines, 2, ("%s = %s(payload, payloadLength, offset + 1%s)"):format(join(decodeResultVars), decodeRequestName, decodeBudgetArg))
+                    addLine(lines, 2, ("ReceiveCompression = __nr_commitFull(ReceiveCompression, %d, payload, offset + 1, nextOffset, mode == 3)"):format(message.id))
+                    addLine(lines, 1, "else")
+                    addLine(lines, 2, ("local body, incomingNext, nextState = __nr_decompress(ReceiveCompression, %d, payload, payloadLength, offset, CompressionWidths[%d] or nil)"):format(message.id, message.id))
+                    if message.max ~= nil then
+                        addLine(lines, 2, ("if len(body) > %d then error(ERR_BOUNDS) end"):format(message.max))
+                    end
+                    addLine(lines, 2, ("%s = %s(body, len(body), 0%s)"):format(join(decodeResultVars), decodeRequestName, decodeBudgetArg))
+                    addLine(lines, 2, "if nextOffset ~= len(body) then error(ERR_BOUNDS) end")
+                    addLine(lines, 2, "nextOffset = incomingNext")
+                    addLine(lines, 2, "ReceiveCompression = nextState")
+                    addLine(lines, 1, "end")
+                    if isServer then addLine(lines, 1, "decodeBudget.compression = ReceiveCompression") end
+                else
+                    addLine(lines, 1, ("local %s = %s(payload, payloadLength, offset%s)"):format(join(decodeResultVars), decodeRequestName, decodeBudgetArg))
+                end
 
+                if isServer and message.rate ~= nil and message.compression ~= nil then
+                    addLine(lines, 1, "local now = os.clock()")
+                    addLine(lines, 1, "local budget = EventBudgets[player]")
+                    addLine(lines, 1, ("if budget == nil then budget = { time = now, tokens = %s }; EventBudgets[player] = budget end"):format(tostring(message.burst)))
+                    addLine(lines, 1, ("budget.tokens = math.min(%s, budget.tokens + math.max(0, now - budget.time) * %s)"):format(tostring(message.burst), tostring(message.rate)))
+                    addLine(lines, 1, "budget.time = now")
+                    addLine(lines, 1, "if budget.tokens < 1 then return nextOffset end")
+                    addLine(lines, 1, "budget.tokens -= 1")
+                end
+                if message.max ~= nil and message.compression == nil then
+                    addLine(lines, 1, ("if nextOffset - offset > %d then return nextOffset end"):format(message.max))
+                end
                 if eventIsPolling then
+                    addLine(lines, 1, ("if %s - %s + 1 >= MaxPollingMessages then return nextOffset end"):format(pollingTailName, pollingHeadName))
                     addLine(lines, 1, ("local __nr_tail = %s + 1"):format(pollingTailName))
                     addLine(lines, 1, ("%s = __nr_tail"):format(pollingTailName))
+                    addLine(lines, 1, schema.limits.MaxPollingMessages == 0 and "local __nr_slot = __nr_tail" or "local __nr_slot = (__nr_tail - 1) % MaxPollingMessages + 1")
                     for argIndex = 1, #pollingArgNames do
-                        addLine(lines, 1, ("%s[__nr_tail] = %s"):format(pollingArgNames[argIndex], callbackArgs[argIndex]))
+                        addLine(lines, 1, ("%s[__nr_slot] = %s"):format(pollingArgNames[argIndex], callbackArgs[argIndex]))
                     end
                     addLine(lines, 1, "return nextOffset")
                 elseif eventIsSingle then
@@ -1406,16 +1682,13 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
                         end
                     else
                         if #callbackArgs > 0 then
-                            addLine(lines, 1, ("callback(%s)"):format(callbackArgList))
+                            addLine(lines, 1, (hasCompression and not isServer and message.category == "reliable" and "task.spawn(xpcall, callback, ReportError, %s)" or "xpcall(callback, ReportError, %s)"):format(callbackArgList))
                         else
-                            addLine(lines, 1, "callback()")
+                            addLine(lines, 1, hasCompression and not isServer and message.category == "reliable" and "task.spawn(xpcall, callback, ReportError)" or "xpcall(callback, ReportError)")
                         end
                     end
                     addLine(lines, 1, "return nextOffset")
                 elseif eventIsMany then
-                    addLine(lines, 1, ("if %s == 0 then"):format(handlerCountName))
-                    addLine(lines, 2, "return nextOffset")
-                    addLine(lines, 1, "end")
                     addLine(lines, 1, ("for __nr_index = 1, %s do"):format(handlerCountName))
                     addLine(lines, 2, ("local callback = %s[__nr_index]"):format(handlerListName))
                     addLine(lines, 2, "if callback ~= nil then")
@@ -1427,9 +1700,9 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
                         end
                     else
                         if #callbackArgs > 0 then
-                            addLine(lines, 3, ("callback(%s)"):format(callbackArgList))
+                            addLine(lines, 3, (hasCompression and not isServer and message.category == "reliable" and "task.spawn(xpcall, callback, ReportError, %s)" or "xpcall(callback, ReportError, %s)"):format(callbackArgList))
                         else
-                            addLine(lines, 3, "callback()")
+                            addLine(lines, 3, hasCompression and not isServer and message.category == "reliable" and "task.spawn(xpcall, callback, ReportError)" or "xpcall(callback, ReportError)")
                         end
                     end
                     addLine(lines, 2, "end")
@@ -1532,6 +1805,7 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
             emitError(lines, 2, validateLevel, info.fullName .. " function response payload must be buffer", "ERR_TYPE")
             addLine(lines, 1, "end")
             addLine(lines, 1, "local responseLength = len(responsePayload)")
+            addLine(lines, 1, "if responseLength > MaxBatchBytes then error(ERR_BOUNDS) end")
             addLine(lines, 1, ("if responseLength < %d then"):format(messageIdWidth.bytes))
             emitError(lines, 2, validateLevel, info.fullName .. " function response payload too short", "ERR_BOUNDS")
             addLine(lines, 1, "end")
@@ -1696,10 +1970,14 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
         else
             error(("Unsupported message category '%s' for message '%s'"):format(message.category, info.fullName))
         end
+        addLine(lines, 0, ("APIs[%d] = %s"):format(index, symbol))
+        addLine(lines, 0, "end")
+        symbolByMessage[message] = ("APIs[%d]"):format(index)
     end
 
     addLine(lines, 0, "local function StepReplication()")
     addLine(lines, 1, "FlushReliable()")
+    if isServer then addLine(lines, 1, "FlushTargeted()") end
     addLine(lines, 1, "FlushUnreliable()")
     addLine(lines, 0, "end")
     addLine(lines, 0, "")
@@ -1729,7 +2007,7 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
     addLine(lines, 0, "local Stats: NetStats = {")
     addLine(lines, 1, "GetReliableDropped = function() return RELIABLE_DROPPED end,")
     addLine(lines, 1, "GetUnreliableDropped = function() return UNRELIABLE_DROPPED end,")
-    addLine(lines, 1, "GetReliableQueueSize = function() return RELIABLE_QUEUE_SIZE end,")
+    addLine(lines, 1, "GetReliableQueueSize = function() return RELIABLE_QUEUE_SIZE" .. (isServer and " + TargetedCount" or "") .. " end,")
     addLine(lines, 1, "GetUnreliableQueueSize = function() return UNRELIABLE_QUEUE_SIZE end,")
     addLine(lines, 0, "}")
     addLine(lines, 0, "")

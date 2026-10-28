@@ -1,53 +1,62 @@
 # CLI Workflow
 
-The NetRay CLI is a standalone frontend for the same compiler core used by the Studio plugin.
+The CLI and Studio plugin use the same compiler. v0.2.0 output includes production runtime modules and a record of the input used to generate them.
 
-## Install With Rokit
-
-```sh
-rokit add AstaWasTaken/NetRay-Compile@<version> netray
-```
-
-The repo name stays `NetRay-Compile`, but the install command above aliases it to `netray` for day-to-day use.
-
-## Compile a Schema
+## Install a Published Release
 
 ```sh
+rokit add AstaWasTaken/NetRay-Compile@v0.2.0 netray
 netray compile path/to/schema.idl --out-dir generated --scope NetRay
 ```
 
-### Arguments
-- `<schema-path>`: required path to the input IDL schema.
+Release downloads bundle Lune. They do not require a separate Lune installation.
 
-### Options
-- `--out-dir <dir>`: required output directory for generated modules.
-- `--scope <name>`: optional fallback scope when the schema does not set `option remote_scope`.
+## Compile a Local Checkout
 
-## Generated Output
+Run from the repository root:
 
-On success, the CLI writes:
-- `generated/Server.luau`
-- `generated/Client.luau`
-- `generated/Types.luau`
-
-If the output directory does not exist, it is created automatically.
-
-## Scope Precedence
-
-`option remote_scope` in the schema takes precedence over the `--scope` CLI option.
-
-Example:
-
-```rust
-option remote_scope = "Combat";
+```sh
+rokit install
+lune run cli/netray.luau compile path/to/schema.idl --out-dir generated --scope NetRay
 ```
 
-With that option present, generated remotes use `Combat_*` names even if you pass `--scope NetRay`.
+Quote paths containing spaces. For example, in PowerShell:
 
-## Failure Behavior
+```powershell
+lune run cli/netray.luau compile "schemas/my network.idl" --out-dir "generated/my network" --scope NetRay
+```
 
-- Missing input file: exits with code `1`
-- Invalid schema: exits with code `1`
-- Invalid output path / write failure: exits with code `1`
+## Arguments and Options
 
-Errors are printed directly in the terminal so the command is usable in scripts and CI jobs.
+| Argument | Required | Meaning |
+| :--- | :--- | :--- |
+| `<schema-path>` | Yes | Input IDL file |
+| `--out-dir <dir>` | Yes | Output folder, created if missing |
+| `--scope <name>` | No | Fallback remote prefix; defaults to `NetRay` |
+| `-h`, `--help` | No | Usage and compiler version |
+
+`option remote_scope` in the schema overrides `--scope`.
+
+## Output Files
+
+| File | Contents |
+| :--- | :--- |
+| `Server.luau` | Server runtime |
+| `Client.luau` | Client runtime |
+| `Types.luau` | Generated Luau types |
+| `Schema.idl` | Exact input schema text |
+| `CompileInfo.txt` | Compiler version, resolved scope, validation, limits and explicit schema options |
+
+The three Luau files are a matching set. Import them as sibling ModuleScripts. The schema and metadata are reference files and do not need to run in the game.
+
+Existing files with these names are overwritten. Schema compilation finishes before output writing begins, but writes are not a filesystem transaction: a write failure can leave partial output. Recompile successfully before importing any files.
+
+## Failures
+
+Missing input, invalid schema, invalid output path or write failure produces exit code `1` and an error on stderr. Success produces exit code `0`.
+
+On macOS/Linux, the bundled launcher's extracted temporary files are cleaned up when it exits normally after success or failure.
+
+## Upgrading
+
+Do not replace only one runtime module. Regenerate Server, Client and Types together and apply the [migration notes](/changelog#v0-2-0). No rate limits or compression settings are required in an existing schema.

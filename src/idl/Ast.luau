@@ -50,6 +50,10 @@ export type Event = {
     reliability: string,
     from: string?,
     call: string?,
+    compression: string?,
+    rate: number?, -- Client-originated messages per second.
+    burst: number?, -- Client-originated messages available at once.
+    max: number?, -- Serialized body bytes, excluding IDs, framing, and passthrough arguments.
 }
 
 export type Function = {
@@ -76,4 +80,31 @@ export type Schema = {
     declarations: { Decl },
 }
 
-return {}
+local LUAU_KEYWORDS: { [string]: boolean } = {
+    ["and"] = true,
+    ["break"] = true,
+    ["do"] = true,
+    ["else"] = true,
+    ["elseif"] = true,
+    ["end"] = true,
+    ["false"] = true,
+    ["for"] = true,
+    ["function"] = true,
+    ["if"] = true,
+    ["in"] = true,
+    ["local"] = true,
+    ["nil"] = true,
+    ["not"] = true,
+    ["or"] = true,
+    ["repeat"] = true,
+    ["return"] = true,
+    ["then"] = true,
+    ["true"] = true,
+    ["until"] = true,
+    ["while"] = true,
+    ["continue"] = true,
+    ["export"] = true,
+    ["type"] = true,
+}
+
+return { LUAU_KEYWORDS = LUAU_KEYWORDS }

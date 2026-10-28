@@ -12,9 +12,13 @@ export type AnalyzedMessage = {
     reliability: string?,
     from: string?,
     call: string?,
+    compression: string?,
     yieldMode: string?,
     id: number,
     category: string,
+    rate: number?,
+    burst: number?,
+    max: number?,
 }
 
 export type AnalyzedScope = {
@@ -29,6 +33,7 @@ export type ValidateLevel = "Off" | "Basic" | "Full"
 export type AnalyzedSchema = {
     options: { Ast.Option },
     validateLevel: ValidateLevel,
+    limits: { [string]: number },
     root: AnalyzedScope,
     remoteScope: string,
     structs: { Ast.Struct },
@@ -55,6 +60,55 @@ local CONTAINER_KINDS: { [string]: boolean } = {
     cframe = true,
     inline_struct = true,
 }
+
+local LIMIT_DEFAULTS = {
+    MaxBatchBytes = 0,
+    MaxBatchMessages = 0,
+    MaxDecodeWork = 0,
+    ReceiveBytesPerSecond = 0,
+    ReceiveByteBurst = 0,
+    ReceiveCallsPerSecond = 0,
+    ReceiveCallBurst = 0,
+    ReceiveMessagesPerSecond = 0,
+    ReceiveMessageBurst = 0,
+    MaxUnreliableBytes = 0,
+    MaxPollingMessages = 0,
+}
+
+local function validateLimit(name: string, value: number, integer: boolean)
+    if not (value > 0 and value <= 2147483647) or (integer and value % 1 ~= 0) then
+        error(("%s must be a positive %s no greater than 2147483647"):format(name, integer and "integer" or "number"))
+    end
+end
+
+local function resolveLimits(options: { Ast.Option }): { [string]: number }
+    local limits = table.clone(LIMIT_DEFAULTS)
+    local seen: { [string]: boolean } = {}
+    for _, option in options do
+        local key = string.lower(option.name)
+        if seen[key] then
+            error(("Duplicate option '%s'"):format(option.name))
+        end
+        seen[key] = true
+        for name in LIMIT_DEFAULTS do
+            if key == string.lower(name) then
+                local value = tonumber(option.value)
+                if value == nil then
+                    error(("%s must be numeric"):format(name))
+                end
+                if value ~= 0 then validateLimit(name, value, not string.find(name, "PerSecond", 1, true)) end
+                limits[name] = value
+            end
+        end
+    end
+    if limits.MaxUnreliableBytes > 1000 then
+        error("MaxUnreliableBytes cannot exceed 1000")
+    end
+    if limits.MaxBatchBytes > 0 and limits.MaxUnreliableBytes > limits.MaxBatchBytes then
+        error("MaxUnreliableBytes cannot exceed MaxBatchBytes")
+    end
+    return limits
+end
 
 local function countPassthrough(params: { Ast.Param }): number
     local count = 0
@@ -112,6 +166,20 @@ local function cloneParamList(params: { Ast.Param }): { Ast.Param }
         out[index] = cloneParam(params[index])
     end
     return out
+end
+
+local function validateParamNames(params: { Ast.Param })
+    local names: { [string]: boolean } = {}
+    for index = 1, #params do
+        local name = params[index].name
+        if Ast.LUAU_KEYWORDS[name] then
+            error(("Reserved Luau parameter name '%s'"):format(name))
+        end
+        if names[name] then
+            error(("Duplicate parameter name '%s'"):format(name))
+        end
+        names[name] = true
+    end
 end
 
 local function analyze(schema: Ast.Schema, remoteScope: string): AnalyzedSchema
@@ -298,9 +366,12 @@ local function analyze(schema: Ast.Schema, remoteScope: string): AnalyzedSchema
                 resolveParams(structDecl.fields)
             elseif (decl :: any).reliability then
                 local eventDecl = decl :: Ast.Event
+                validateParamNames(eventDecl.params)
                 resolveParams(eventDecl.params)
             elseif (decl :: any).returns then
                 local functionDecl = decl :: Ast.Function
+                validateParamNames(functionDecl.params)
+                validateParamNames(functionDecl.returns)
                 resolveParams(functionDecl.params)
                 resolveParams(functionDecl.returns)
             elseif (decl :: any).variants then
@@ -315,6 +386,43 @@ local function analyze(schema: Ast.Schema, remoteScope: string): AnalyzedSchema
 
     resolveDecls(schema.declarations)
 
+    local function hasReference(typeDef: Ast.Type, seen: { [string]: boolean }): boolean
+        if typeDef.kind == "passthrough" then
+            return true
+        end
+        local struct = structByName[typeDef.kind]
+        if struct then
+            if seen[typeDef.kind] then
+                error("Event compression does not support recursive types")
+            end
+            seen[typeDef.kind] = true
+            for _, field in struct.fields do
+                if hasReference(field.type, seen) then
+                    return true
+                end
+            end
+            seen[typeDef.kind] = nil
+        end
+        for _, child in { typeDef.value, typeDef.key } do
+            if type(child) == "table" and hasReference(child, seen) then
+                return true
+            end
+        end
+        for _, field in typeDef.fields or {} do
+            if hasReference(field.type, seen) then
+                return true
+            end
+        end
+        for _, variant in typeDef.variants or {} do
+            for _, field in variant.fields or {} do
+                if hasReference(field.type, seen) then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
     local function analyzeDecls(decls: { Ast.Decl }, scopeName: string, scopeFullName: string): AnalyzedScope
         local scope: AnalyzedScope = {
             name = scopeName,
@@ -323,8 +431,18 @@ local function analyze(schema: Ast.Schema, remoteScope: string): AnalyzedSchema
             scopes = {},
         }
 
+        local names: { [string]: boolean } = {}
         for index = 1, #decls do
             local decl = decls[index]
+            if (decl :: any).declarations or (decl :: any).returns or (decl :: any).reliability then
+                if names[decl.name] then
+                    error(("Duplicate API name '%s.%s'"):format(scopeFullName, decl.name))
+                end
+                if scopeFullName == "Net" and (decl.name == "StepReplication" or decl.name == "Stats") then
+                    error(("Reserved root API name '%s'"):format(decl.name))
+                end
+                names[decl.name] = true
+            end
             if decl.name and (decl :: any).declarations then
                 local child = decl :: Ast.Scope
                 local nested = analyzeDecls(child.declarations, child.name, scopeFullName .. "." .. child.name)
@@ -349,6 +467,31 @@ local function analyze(schema: Ast.Schema, remoteScope: string): AnalyzedSchema
             elseif (decl :: any).reliability then
                 local eventDecl = decl :: Ast.Event
                 local reliability = eventDecl.reliability
+                if eventDecl.compression ~= nil then
+                    if reliability ~= "reliable" then
+                        error("Event compression requires a reliable event")
+                    end
+                    for _, param in eventDecl.params do
+                        if hasReference(param.type, {}) then
+                            error("Event compression does not support passthrough or instance references")
+                        end
+                    end
+                end
+                if eventDecl.rate ~= nil then
+                    validateLimit("Event rate", eventDecl.rate, false)
+                    if eventDecl.from == "server" then
+                        error("Event rate is only supported for client-originated events")
+                    end
+                end
+                if eventDecl.burst ~= nil then
+                    validateLimit("Event burst", eventDecl.burst, true)
+                    if eventDecl.rate == nil then
+                        error("Event burst requires rate")
+                    end
+                end
+                if eventDecl.max ~= nil then
+                    validateLimit("Event max (serialized body bytes)", eventDecl.max, true)
+                end
                 local category = reliability == "unreliable" and "unreliable" or "reliable"
                 if category == "unreliable" then
                     unreliableId += 1
@@ -363,6 +506,10 @@ local function analyze(schema: Ast.Schema, remoteScope: string): AnalyzedSchema
                     reliability = reliability,
                     from = eventDecl.from or "both",
                     call = eventDecl.call,
+                    compression = eventDecl.compression,
+                    rate = eventDecl.rate,
+                    burst = eventDecl.burst or (eventDecl.rate and math.ceil(eventDecl.rate)),
+                    max = eventDecl.max,
                     id = id,
                     category = category,
                 }
@@ -388,6 +535,7 @@ local function analyze(schema: Ast.Schema, remoteScope: string): AnalyzedSchema
     return {
         options = schema.options,
         validateLevel = resolveValidateLevel(schema.options),
+        limits = resolveLimits(schema.options),
         root = root,
         remoteScope = remoteScope,
         structs = structs,

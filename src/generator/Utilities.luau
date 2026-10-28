@@ -55,7 +55,7 @@ local function validateBoundedLength(maxValue: number?, typeLabel: string): numb
     return maxValue
 end
 
-local function getLengthPrefixInfo(typeLabel: string, maxValue: number?): LengthPrefixInfo
+local function getLengthPrefixInfo(typeLabel: string, maxValue: number?, minValue: number?): LengthPrefixInfo
     local declaredMax = validateBoundedLength(maxValue, typeLabel)
     if declaredMax == nil then
         return {
@@ -67,16 +67,17 @@ local function getLengthPrefixInfo(typeLabel: string, maxValue: number?): Length
     return {
         declaredMax = declaredMax,
         isVarint = false,
-        width = widthForBound(declaredMax),
+        width = if declaredMax == minValue then { bytes = 0, writer = "", reader = "", maxValue = 0 }
+            else widthForBound(declaredMax - (minValue or 0)),
     }
 end
 
 local function getStringLengthPrefixInfo(typeDef: Ast.Type): LengthPrefixInfo
-    return getLengthPrefixInfo("String", typeDef.max)
+    return getLengthPrefixInfo("String", typeDef.max, typeDef.min)
 end
 
 local function getArrayLengthPrefixInfo(typeDef: Ast.Type): LengthPrefixInfo
-    return getLengthPrefixInfo("Array", typeDef.max)
+    return getLengthPrefixInfo("Array", typeDef.max, typeDef.min)
 end
 
 local function getFixedArrayLength(typeDef: Ast.Type): number
@@ -94,7 +95,7 @@ local function getFixedArrayLength(typeDef: Ast.Type): number
 end
 
 local function getMapLengthPrefixInfo(typeDef: Ast.Type): LengthPrefixInfo
-    return getLengthPrefixInfo("Map", typeDef.max)
+    return getLengthPrefixInfo("Map", typeDef.max, typeDef.min)
 end
 
 local function getMessageIdWidthInfo(maxId: number): WidthInfo

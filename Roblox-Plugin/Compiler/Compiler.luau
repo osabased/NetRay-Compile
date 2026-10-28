@@ -11,7 +11,16 @@ export type CompileResult = {
 	server: string,
 	client: string,
 	types: string,
+	metadata: {
+		compilerVersion: string,
+		remoteScope: string,
+		validateLevel: string,
+		limits: { [string]: number },
+		options: { [string]: string },
+	},
 }
+
+local VERSION = "0.2.0"
 
 local FORBIDDEN_PATTERNS = {
 	"string.pack",
@@ -56,10 +65,26 @@ local function compile(idlText: string, remoteScope: string?): CompileResult
 	verifyForbidden(generated.server, "Server.luau")
 	verifyForbidden(generated.client, "Client.luau")
 	verifyForbidden(generated.types, "Types.luau")
-	return generated
+	local options: { [string]: string } = {}
+	for _, option in analyzed.options do
+		options[option.name] = option.value
+	end
+	return {
+		server = generated.server,
+		client = generated.client,
+		types = generated.types,
+		metadata = {
+			compilerVersion = VERSION,
+			remoteScope = scopeName,
+			validateLevel = analyzed.validateLevel,
+			limits = analyzed.limits,
+			options = options,
+		},
+	}
 end
 
 return {
 	compile = compile,
 	verifyForbidden = verifyForbidden,
+	version = VERSION,
 }

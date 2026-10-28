@@ -113,7 +113,7 @@ scope Gameplay {
 }
 ```
 
-## Entities Example (Current `schemas/entities.idl`)
+## Single-Entity Example
 ```rust
 struct Entities {
   brand: string,
@@ -137,3 +137,71 @@ function Ping {
   Return: (f64),
 }
 ```
+
+## Repeat Compression (Opt-In)
+
+```rust
+event Status {
+  From: Server,
+  Type: Reliable,
+  Compression: Repeat,
+  Data: string<200>,
+}
+```
+
+Each accepted event still reaches its handler. Identical serialized bodies use a repeat marker. Omit `Compression` for ordinary encoding.
+
+## Field Masks (Opt-In)
+
+```rust
+event State {
+  From: Server,
+  Type: Reliable,
+  Compression: Fields,
+  Data: (u32, u32, u32),
+}
+```
+
+Each tuple argument is a separate mask section. Fixed-width named structs can be sections too, but their members are not split into independent mask bits.
+
+## Vectors
+
+```rust
+event Positions {
+  From: Client,
+  Type: Reliable,
+  Data: array<vector<f32>>,
+}
+```
+
+`vector3` is also accepted. This event has no delta compression or operational limits unless added explicitly.
+
+## Per-Event Rate and Size Limits (Opt-In)
+
+```rust
+event Action {
+  From: Client,
+  Rate: 5,
+  Burst: 10,
+  Max: 128,
+  Data: (u16, string<100>),
+}
+```
+
+This allows an initial burst of ten accepted events per player and refills five tokens per second. `Max` limits the serialized body, including its length prefixes. These numbers are examples, not defaults.
+
+## Shared Server Receive Budget (Opt-In)
+
+```rust
+option ReceiveCallsPerSecond = 60;
+option ReceiveCallBurst = 120;
+option ReceiveBytesPerSecond = 32768;
+option ReceiveByteBurst = 65536;
+
+event Input {
+  From: Client,
+  Data: (u16, f32),
+}
+```
+
+These budgets apply across the generated module's incoming channels for each player. Omit the options or set them to zero to disable them.
