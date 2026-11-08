@@ -58,7 +58,7 @@ Structural checks reject malformed lengths, truncated buffers and invalid tags e
 
 Server call/byte admission runs before decoding. Per-event rate limits may still need a schema-aware skip to find the next record. Compressed events must reconstruct and validate their bodies before per-event rate rejection so later records retain a valid baseline. Use global receive budgets when the goal is to reduce work before event decoding.
 
-A receive error stops the remainder of that invocation; it does not roll back callbacks already delivered. Runtime warnings are throttled to avoid flooding output. Drops and warnings are not an acknowledgment protocol.
+A receive error stops the remainder of that invocation; it does not roll back callbacks already delivered. A message whose passthrough arguments are missing or fail validation is dropped alone, with a throttled warning, and the rest of the batch is still delivered. Runtime warnings are throttled to avoid flooding output. Drops and warnings are not an acknowledgment protocol.
 
 ## Callbacks and Polling
 

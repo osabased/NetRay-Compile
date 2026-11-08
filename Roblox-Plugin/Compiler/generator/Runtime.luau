@@ -262,10 +262,8 @@ local function emitQueue(
     addLine(lines, 0, ("local %s_QUEUE_SIZE = 0"):format(upper))
     addLine(lines, 0, ("local %s_DROPPED = 0"):format(upper))
     if maxPassArgs > 0 then
-        addLine(lines, 0, ("local %s_QUEUE_PASS_COUNT = table.create(DEFAULT_BATCH_CAPACITY, 0)"):format(upper))
-        for passIndex = 1, maxPassArgs do
-            addLine(lines, 0, ("local %s_QUEUE_PASS_%d = table.create(DEFAULT_BATCH_CAPACITY)"):format(upper, passIndex))
-        end
+        addLine(lines, 0, ("local %s_PASS_VALUES: { unknown } = table.create(DEFAULT_BATCH_CAPACITY)"):format(upper))
+        addLine(lines, 0, ("local %s_PASS_SIZE = 0"):format(upper))
     end
     addLine(lines, 0, ("local %s_ENDS = {}"):format(upper))
     addLine(lines, 0, ("local %s_IDS = {}"):format(upper))
@@ -359,29 +357,9 @@ local function FlushPREFIX()
     if maxPassArgs == 0 then
         addLine(lines, 1, ("%s:%s(payloadToSend)"):format(remoteVar, fireMethod))
     else
-        addLine(lines, 1, ("local messageCount = %s_QUEUE_SIZE"):format(upper))
-        addLine(lines, 1, "local passCountList = table.create(messageCount, 0)")
-        addLine(lines, 1, "for index = 1, messageCount do")
-        addLine(lines, 2, ("passCountList[index] = %s_QUEUE_PASS_COUNT[index]"):format(upper))
-        addLine(lines, 2, ("%s_QUEUE_PASS_COUNT[index] = 0"):format(upper))
-        addLine(lines, 1, "end")
-
-        local passValueLists: { string } = {}
-        for passIndex = 1, maxPassArgs do
-            local passListName = ("passList_%d"):format(passIndex)
-            passValueLists[#passValueLists + 1] = passListName
-            addLine(lines, 1, ("local %s = table.create(messageCount)"):format(passListName))
-            addLine(lines, 1, "for index = 1, messageCount do")
-            addLine(lines, 2, ("%s[index] = %s_QUEUE_PASS_%d[index]"):format(passListName, upper, passIndex))
-            addLine(lines, 2, ("%s_QUEUE_PASS_%d[index] = nil"):format(upper, passIndex))
-            addLine(lines, 1, "end")
-        end
-
-        local callArgs: { string } = { "payloadToSend", "passCountList" }
-        for passIndex = 1, #passValueLists do
-            callArgs[#callArgs + 1] = passValueLists[passIndex]
-        end
-        addLine(lines, 1, ("%s:%s(%s)"):format(remoteVar, fireMethod, join(callArgs)))
+        addLine(lines, 1, ("%s:%s(payloadToSend, table.unpack(%s_PASS_VALUES, 1, %s_PASS_SIZE))"):format(remoteVar, fireMethod, upper, upper))
+        addLine(lines, 1, ("table.clear(%s_PASS_VALUES)"):format(upper))
+        addLine(lines, 1, ("%s_PASS_SIZE = 0"):format(upper))
     end
 
     addLine(lines, 1, ("%s_CURSOR = 0"):format(upper))
@@ -404,13 +382,13 @@ local function emitEventListener(
     local upper = string.upper(prefix)
     if isServer then
         if maxPassArgs > 0 then
-            addLine(lines, 0, ("local function Receive%s(player: Player, payload: unknown, passCountList: unknown, ...: unknown)"):format(prefix))
+            addLine(lines, 0, ("local function Receive%s(player: Player, payload: unknown, ...: unknown)"):format(prefix))
         else
             addLine(lines, 0, ("local function Receive%s(player: Player, payload: unknown)"):format(prefix))
         end
     else
         if maxPassArgs > 0 then
-            addLine(lines, 0, ("local function Receive%s(payload: unknown, passCountList: unknown, ...: unknown)"):format(prefix))
+            addLine(lines, 0, ("local function Receive%s(payload: unknown, ...: unknown)"):format(prefix))
         else
             addLine(lines, 0, ("local function Receive%s(payload: unknown)"):format(prefix))
         end
@@ -427,19 +405,15 @@ local function emitEventListener(
     addLine(lines, 2, "return")
     addLine(lines, 1, "end")
     if maxPassArgs > 0 then
-        local passTables: { string } = {}
-        for passIndex = 1, maxPassArgs do
-            passTables[#passTables + 1] = ("passTable%d"):format(passIndex)
-        end
-        addLine(lines, 1, ("local %s = ..."):format(join(passTables)))
+        -- Each message takes its schema's passthrough count from these arguments, in batch order.
+        addLine(lines, 1, "local passTotal = select(\"#\", ...)")
+        addLine(lines, 1, "local passValues = { ... }")
+        addLine(lines, 1, "local passCursor = 0")
     end
     addLine(lines, 1, "local offset = 0")
     addLine(lines, 1, "local remainingMessages = MAX_BATCH_MESSAGES")
     if isServer then
         addLine(lines, 1, "local decodeBudget = { remaining = MaxDecodeWork }")
-    end
-    if maxPassArgs > 0 then
-        addLine(lines, 1, "local messageIndex = 0")
     end
     addLine(lines, 1, "while offset < payloadLength do")
     if messageIdWidth.bytes > 1 then
@@ -480,22 +454,13 @@ local function emitEventListener(
         addLine(lines, 2, "if not Admit(player, nil, segmentCount) then return end")
     end
     addLine(lines, 2, "remainingMessages -= segmentCount")
+    if maxPassArgs > 0 then
+        addLine(lines, 2, ("local passWidth = %s_PASS_WIDTH[messageId]"):format(upper))
+    end
     addLine(lines, 2, "for _segmentIndex = 1, segmentCount do")
     if maxPassArgs > 0 then
-        addLine(lines, 3, "messageIndex += 1")
-        addLine(lines, 3, "local passCount = 0")
-        addLine(lines, 3, "if type(passCountList) == \"table\" then")
-        addLine(lines, 4, "local rawPassCount = (passCountList :: { unknown })[messageIndex]")
-        addLine(lines, 4, "if type(rawPassCount) == \"number\" then")
-        addLine(lines, 5, "passCount = rawPassCount")
-        addLine(lines, 4, "end")
-        addLine(lines, 3, "end")
-        for passIndex = 1, maxPassArgs do
-            addLine(lines, 3, ("local messagePass%d = nil"):format(passIndex))
-            addLine(lines, 3, ("if type(passTable%d) == \"table\" then"):format(passIndex))
-            addLine(lines, 4, ("messagePass%d = (passTable%d :: { unknown })[messageIndex]"):format(passIndex, passIndex))
-            addLine(lines, 3, "end")
-        end
+        -- A short call gives the message fewer values than its width, which its validator rejects.
+        addLine(lines, 3, "local passCount = math.clamp(passTotal - passCursor, 0, passWidth)")
     end
 
     local callArgs: { string } = {}
@@ -512,9 +477,13 @@ local function emitEventListener(
         callArgs[#callArgs + 1] = "passCount"
     end
     for passIndex = 1, maxPassArgs do
-        callArgs[#callArgs + 1] = ("messagePass%d"):format(passIndex)
+        callArgs[#callArgs + 1] = ("passValues[passCursor + %d]"):format(passIndex)
     end
     addLine(lines, 3, ("local nextOffset = dispatch(%s)"):format(join(callArgs)))
+    if maxPassArgs > 0 then
+        -- The cursor moves by the schema width even when dispatch drops the message, so later messages keep their values.
+        addLine(lines, 3, "passCursor += passWidth")
+    end
     do
         addLine(lines, 3, "if type(nextOffset) ~= \"number\" then")
         addLine(lines, 4, "return")
@@ -940,6 +909,16 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
     addLine(lines, 0, "local RELIABLE_SKIP: { Dispatch } = table.create(MAX_RELIABLE_ID)")
     addLine(lines, 0, "local UNRELIABLE_SKIP: { Dispatch } = table.create(MAX_UNRELIABLE_ID)")
     addLine(lines, 0, "local FUNCTION_DISPATCH: { Dispatch } = table.create(MAX_FUNCTION_ID)")
+    if schema.maxPassArgs.reliable > 0 or schema.maxPassArgs.unreliable > 0 then
+        -- Passthrough values travel as the remote call's own arguments; Studio delivered 4096 of them in one call.
+        addLine(lines, 0, "local MAX_PASS_VALUES = 4096")
+    end
+    if schema.maxPassArgs.reliable > 0 then
+        addLine(lines, 0, "local RELIABLE_PASS_WIDTH: { number } = table.create(MAX_RELIABLE_ID, 0)")
+    end
+    if schema.maxPassArgs.unreliable > 0 then
+        addLine(lines, 0, "local UNRELIABLE_PASS_WIDTH: { number } = table.create(MAX_UNRELIABLE_ID, 0)")
+    end
     addLine(lines, 0, "")
 
     local hasCompression = false
@@ -986,7 +965,7 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
 
     if isServer then
         local targetedSource = [[
-type TargetQueue = { bytes: number, [number]: { any } }
+TARGET_QUEUE_TYPE
 local Targeted: { [Player]: TargetQueue } = {}
 local TargetedBytes = 0
 local TargetedCount = 0
@@ -1025,10 +1004,9 @@ local function QueueTarget(player: Player, payload: buffer, ...: any): boolean
     FlushReliable()
     local bytes = len(payload) COMPRESSION_RESERVE
     if bytes > MaxBatchBytes then RELIABLE_DROPPED += 1; ReportError("NetRay outgoing message exceeds byte limit"); return false end
-    if TargetedBytes + bytes > MaxBatchBytes or TargetedCount >= MAX_BATCH_MESSAGES then FlushTargeted() end
+    TARGET_FLUSH
     local queue = Targeted[player]
-    if queue == nil then queue = { bytes = 0 }; Targeted[player] = queue end
-    queue[#queue + 1] = { payload, ... }
+    TARGET_QUEUE_PUSH
     queue.bytes += bytes
     TargetedBytes += bytes
     TargetedCount += 1
@@ -1040,20 +1018,30 @@ Players.PlayerRemoving:Connect(function(player: Player)
     COMPRESSION_REMOVE
 end)
 ]]
-        -- With no passthrough arguments the per-pass tables and loops would be dead code, so they are left out.
+        -- With no passthrough arguments the passthrough bookkeeping would be dead code, so it is left out.
         local maxPass = schema.maxPassArgs.reliable
         if maxPass > 0 then
-            targetedSource = string.gsub(targetedSource, "PASS_SETUP", ([[local passCounts: { number } = {}
-        local passLists: { { unknown } } = table.create(%d)
-        for passIndex = 1, %d do passLists[passIndex] = {} end]]):format(maxPass, maxPass))
-            targetedSource = string.gsub(targetedSource, "PASS_COLLECT", ([[local message = queue[index]
-            passCounts[index] = message[2] and message[2][1] or 0
-            for passIndex = 1, %d do
-                local values = message[passIndex + 2]
-                passLists[passIndex][index] = values and values[1]
-            end]]):format(maxPass))
-            targetedSource = string.gsub(targetedSource, " PASS_ARGS", (", passCounts, table.unpack(passLists, 1, %d)"):format(maxPass))
+            targetedSource = string.gsub(targetedSource, "TARGET_QUEUE_TYPE", "type TargetQueue = { bytes: number, passes: number, [number]: { any } }")
+            -- A record keeps its passthrough count, since values that are nil under Validate Off leave no length.
+            targetedSource = string.gsub(targetedSource, "TARGET_FLUSH", [[local passCount = select("#", ...)
+    local pending = Targeted[player]
+    if TargetedBytes + bytes > MaxBatchBytes or TargetedCount >= MAX_BATCH_MESSAGES or (pending ~= nil and pending.passes + passCount > MAX_PASS_VALUES) then FlushTargeted() end]])
+            targetedSource = string.gsub(targetedSource, "TARGET_QUEUE_PUSH", [[if queue == nil then queue = { bytes = 0, passes = 0 }; Targeted[player] = queue end
+    queue[#queue + 1] = { payload, passCount, ... }
+    queue.passes += passCount]])
+            targetedSource = string.gsub(targetedSource, "PASS_SETUP", [[local passValues: { unknown } = table.create(queue.passes)
+        local passCount = 0]])
+            targetedSource = string.gsub(targetedSource, "PASS_COLLECT", [=[local message = queue[index]
+            for passIndex = 1, message[2] do
+                passValues[passCount + passIndex] = message[passIndex + 2]
+            end
+            passCount += message[2]]=])
+            targetedSource = string.gsub(targetedSource, " PASS_ARGS", ", table.unpack(passValues, 1, passCount)")
         else
+            targetedSource = string.gsub(targetedSource, "TARGET_QUEUE_TYPE", "type TargetQueue = { bytes: number, [number]: { any } }")
+            targetedSource = string.gsub(targetedSource, "TARGET_FLUSH", "if TargetedBytes + bytes > MaxBatchBytes or TargetedCount >= MAX_BATCH_MESSAGES then FlushTargeted() end")
+            targetedSource = string.gsub(targetedSource, "TARGET_QUEUE_PUSH", [[if queue == nil then queue = { bytes = 0 }; Targeted[player] = queue end
+    queue[#queue + 1] = { payload, ... }]])
             targetedSource = string.gsub(targetedSource, "PASS_SETUP", "")
             targetedSource = string.gsub(targetedSource, "PASS_COLLECT", "")
             targetedSource = string.gsub(targetedSource, " PASS_ARGS", "")
@@ -1328,7 +1316,8 @@ end)
                 end
                 if isServer and message.category == "reliable" then addLine(lines, 1, "FlushTargeted()") end
                 local batchReserve = hasCompression and not isServer and message.category == "reliable" and " + RELIABLE_QUEUE_SIZE + 1" or ""
-                addLine(lines, 1, ("if %s_QUEUE_SIZE >= MAX_BATCH_MESSAGES or %s_CURSOR + __nr_totalSize%s > %s then Flush%s() end"):format(queueUpper, queueUpper, batchReserve, byteLimit, message.category == "unreliable" and "Unreliable" or "Reliable"))
+                local passReserve = #info.passthroughParams > 0 and (" or %s_PASS_SIZE + %d > MAX_PASS_VALUES"):format(queueUpper, #info.passthroughParams) or ""
+                addLine(lines, 1, ("if %s_QUEUE_SIZE >= MAX_BATCH_MESSAGES or %s_CURSOR + __nr_totalSize%s > %s%s then Flush%s() end"):format(queueUpper, queueUpper, batchReserve, byteLimit, passReserve, message.category == "unreliable" and "Unreliable" or "Reliable"))
                 addLine(lines, 1, ("local __nr_base = %s_CURSOR"):format(queueUpper))
                 addLine(lines, 1, "local __nr_required = __nr_base + __nr_totalSize")
                 addLine(lines, 1, ("if __nr_required > %s_ARENA_CAPACITY then"):format(queueUpper))
@@ -1390,13 +1379,12 @@ end)
                 addLine(lines, 1, ("%s_QUEUE_SIZE += 1"):format(queueUpper))
                 addLine(lines, 1, ("%s_ENDS[%s_QUEUE_SIZE] = __nr_required"):format(queueUpper, queueUpper))
                 addLine(lines, 1, ("%s_IDS[%s_QUEUE_SIZE] = %s"):format(queueUpper, queueUpper, messageIdConst))
-                if categoryMaxPass > 0 then
-                    addLine(lines, 1, ("local __nr_slot = %s_QUEUE_SIZE"):format(queueUpper))
-                    addLine(lines, 1, ("%s_QUEUE_PASS_COUNT[__nr_slot] = %d"):format(queueUpper, #info.passthroughParams))
-                    for passIndex = 1, categoryMaxPass do
-                        local passValueExpr = passIndex <= #passthroughNames and passthroughNames[passIndex] or "nil"
-                        addLine(lines, 1, ("%s_QUEUE_PASS_%d[__nr_slot] = %s"):format(queueUpper, passIndex, passValueExpr))
+                if #passthroughNames > 0 then
+                    addLine(lines, 1, ("local __nr_pass = %s_PASS_SIZE"):format(queueUpper))
+                    for passIndex = 1, #passthroughNames do
+                        addLine(lines, 1, ("%s_PASS_VALUES[__nr_pass + %d] = %s"):format(queueUpper, passIndex, passthroughNames[passIndex]))
                     end
+                    addLine(lines, 1, ("%s_PASS_SIZE = __nr_pass + %d"):format(queueUpper, #passthroughNames))
                 end
                 addLine(lines, 1, "return true")
                 end
@@ -1405,6 +1393,7 @@ end)
             end
 
             if canEmitFire and isServer then
+                local passArgSuffix = #passthroughNames > 0 and (", " .. join(passthroughNames)) or ""
                 local fireSignatureParts: { string } = { "player: Player" }
                 local fireListSignatureParts: { string } = { "players: { Player }" }
                 local fireExceptSignatureParts: { string } = { "excludedPlayer: Player" }
@@ -1440,20 +1429,7 @@ end)
                 if message.max ~= nil then
                     addLine(lines, 1, ("if len(__nr_payload) - %d > %d then %s_DROPPED += 1; return false end"):format(messageIdWidth.bytes, message.max, queueUpper))
                 end
-                if categoryMaxPass > 0 then
-                    addLine(lines, 1, ("local __nr_passCountList = table.create(1, %d)"):format(#info.passthroughParams))
-                    local firePassArgs: { string } = { "player", "__nr_payload", "__nr_passCountList" }
-                    for passIndex = 1, categoryMaxPass do
-                        local passListName = ("__nr_passList_%d"):format(passIndex)
-                        local passValueExpr = passIndex <= #passthroughNames and passthroughNames[passIndex] or "nil"
-                        addLine(lines, 1, ("local %s = table.create(1)"):format(passListName))
-                        addLine(lines, 1, ("%s[1] = %s"):format(passListName, passValueExpr))
-                        firePassArgs[#firePassArgs + 1] = passListName
-                    end
-                    addLine(lines, 1, ("%s(%s)"):format(targetCall, join(firePassArgs)))
-                else
-                    addLine(lines, 1, ("%s(player, __nr_payload)"):format(targetCall))
-                end
+                addLine(lines, 1, ("%s(player, __nr_payload%s)"):format(targetCall, passArgSuffix))
                 addLine(lines, 1, "return true")
                 addLine(lines, 0, "end")
                 addLine(lines, 0, "")
@@ -1482,32 +1458,13 @@ end)
                 if message.max ~= nil then
                     addLine(lines, 1, ("if len(__nr_payload) - %d > %d then %s_DROPPED += 1; return false end"):format(messageIdWidth.bytes, message.max, queueUpper))
                 end
-                if categoryMaxPass > 0 then
-                    addLine(lines, 1, ("local __nr_passCountList = table.create(1, %d)"):format(#info.passthroughParams))
-                    local fireListPassArgs: { string } = { "__nr_target", "__nr_payload", "__nr_passCountList" }
-                    for passIndex = 1, categoryMaxPass do
-                        local passListName = ("__nr_passList_%d"):format(passIndex)
-                        local passValueExpr = passIndex <= #passthroughNames and passthroughNames[passIndex] or "nil"
-                        addLine(lines, 1, ("local %s = table.create(1)"):format(passListName))
-                        addLine(lines, 1, ("%s[1] = %s"):format(passListName, passValueExpr))
-                        fireListPassArgs[#fireListPassArgs + 1] = passListName
-                    end
-                    addLine(lines, 1, "for __nr_index = 1, #players do")
-                    addLine(lines, 2, "local __nr_target = players[__nr_index]")
-                    addLine(lines, 2, "if typeof(__nr_target) ~= \"Instance\" or not __nr_target:IsA(\"Player\") then")
-                    emitError(lines, 3, validateLevel, info.fullName .. " FireList requires Player values", "ERR_TYPE")
-                    addLine(lines, 2, "end")
-                    addLine(lines, 2, ("%s(%s)"):format(targetCall, join(fireListPassArgs)))
-                    addLine(lines, 1, "end")
-                else
-                    addLine(lines, 1, "for __nr_index = 1, #players do")
-                    addLine(lines, 2, "local __nr_target = players[__nr_index]")
-                    addLine(lines, 2, "if typeof(__nr_target) ~= \"Instance\" or not __nr_target:IsA(\"Player\") then")
-                    emitError(lines, 3, validateLevel, info.fullName .. " FireList requires Player values", "ERR_TYPE")
-                    addLine(lines, 2, "end")
-                    addLine(lines, 2, ("%s(__nr_target, __nr_payload)"):format(targetCall))
-                    addLine(lines, 1, "end")
-                end
+                addLine(lines, 1, "for __nr_index = 1, #players do")
+                addLine(lines, 2, "local __nr_target = players[__nr_index]")
+                addLine(lines, 2, "if typeof(__nr_target) ~= \"Instance\" or not __nr_target:IsA(\"Player\") then")
+                emitError(lines, 3, validateLevel, info.fullName .. " FireList requires Player values", "ERR_TYPE")
+                addLine(lines, 2, "end")
+                addLine(lines, 2, ("%s(__nr_target, __nr_payload%s)"):format(targetCall, passArgSuffix))
+                addLine(lines, 1, "end")
                 addLine(lines, 1, "return true")
                 addLine(lines, 0, "end")
                 addLine(lines, 0, "")
@@ -1537,30 +1494,12 @@ end)
                     addLine(lines, 1, ("if len(__nr_payload) - %d > %d then %s_DROPPED += 1; return false end"):format(messageIdWidth.bytes, message.max, queueUpper))
                 end
                 addLine(lines, 1, "local __nr_players = Players:GetPlayers()")
-                if categoryMaxPass > 0 then
-                    addLine(lines, 1, ("local __nr_passCountList = table.create(1, %d)"):format(#info.passthroughParams))
-                    local fireExceptPassArgs: { string } = { "__nr_target", "__nr_payload", "__nr_passCountList" }
-                    for passIndex = 1, categoryMaxPass do
-                        local passListName = ("__nr_passList_%d"):format(passIndex)
-                        local passValueExpr = passIndex <= #passthroughNames and passthroughNames[passIndex] or "nil"
-                        addLine(lines, 1, ("local %s = table.create(1)"):format(passListName))
-                        addLine(lines, 1, ("%s[1] = %s"):format(passListName, passValueExpr))
-                        fireExceptPassArgs[#fireExceptPassArgs + 1] = passListName
-                    end
-                    addLine(lines, 1, "for __nr_index = 1, #__nr_players do")
-                    addLine(lines, 2, "local __nr_target = __nr_players[__nr_index]")
-                    addLine(lines, 2, "if __nr_target ~= excludedPlayer then")
-                    addLine(lines, 3, ("%s(%s)"):format(targetCall, join(fireExceptPassArgs)))
-                    addLine(lines, 2, "end")
-                    addLine(lines, 1, "end")
-                else
-                    addLine(lines, 1, "for __nr_index = 1, #__nr_players do")
-                    addLine(lines, 2, "local __nr_target = __nr_players[__nr_index]")
-                    addLine(lines, 2, "if __nr_target ~= excludedPlayer then")
-                    addLine(lines, 3, ("%s(__nr_target, __nr_payload)"):format(targetCall))
-                    addLine(lines, 2, "end")
-                    addLine(lines, 1, "end")
-                end
+                addLine(lines, 1, "for __nr_index = 1, #__nr_players do")
+                addLine(lines, 2, "local __nr_target = __nr_players[__nr_index]")
+                addLine(lines, 2, "if __nr_target ~= excludedPlayer then")
+                addLine(lines, 3, ("%s(__nr_target, __nr_payload%s)"):format(targetCall, passArgSuffix))
+                addLine(lines, 2, "end")
+                addLine(lines, 1, "end")
                 addLine(lines, 1, "return true")
                 addLine(lines, 0, "end")
                 addLine(lines, 0, "")
@@ -1659,6 +1598,10 @@ end)
                     signatureArgs[#signatureArgs + 1] = ("pass%d: unknown"):format(passIndex)
                 end
 
+                if #info.passthroughParams > 0 then
+                    local widthVar = message.category == "unreliable" and "UNRELIABLE_PASS_WIDTH" or "RELIABLE_PASS_WIDTH"
+                    addLine(lines, 0, ("%s[%d] = %d"):format(widthVar, message.id, #info.passthroughParams))
+                end
                 addLine(lines, 0, ("%s[%d] = function(%s)"):format(dispatchVar, message.id, join(signatureArgs)))
                 local decodeBudgetArg = if isServer then ", decodeBudget" else ""
                 if message.max ~= nil and message.compression == nil then
@@ -1673,15 +1616,6 @@ end)
                     addLine(lines, 1, "budget.time = now")
                     addLine(lines, 1, ("if budget.tokens < 1 then return %s(payload, payloadLength, offset%s) end"):format(skipName, decodeBudgetArg))
                     addLine(lines, 1, "budget.tokens -= 1")
-                end
-                if requestNeedsPassValidation then
-                    local passVarsForValidation: { string } = { "passCount" }
-                    for passIndex = 1, #info.passthroughParams do
-                        passVarsForValidation[#passVarsForValidation + 1] = ("pass%d"):format(passIndex)
-                    end
-                    addLine(lines, 1, ("if not %s(%s) then"):format(requestPassValidator, join(passVarsForValidation)))
-                    addLine(lines, 2, "return payloadLength")
-                    addLine(lines, 1, "end")
                 end
 
                 local decodeResultVars: { string } = {}
@@ -1714,6 +1648,17 @@ end)
                     if isServer then addLine(lines, 1, "decodeBudget.compression = ReceiveCompression") end
                 else
                     addLine(lines, 1, ("local %s = %s(payload, payloadLength, offset%s)"):format(join(decodeResultVars), decodeRequestName, decodeBudgetArg))
+                end
+                if requestNeedsPassValidation then
+                    -- Validated after decoding, which yields the next record's offset, so only this message is dropped.
+                    local passVarsForValidation: { string } = { "passCount" }
+                    for passIndex = 1, #info.passthroughParams do
+                        passVarsForValidation[#passVarsForValidation + 1] = ("pass%d"):format(passIndex)
+                    end
+                    addLine(lines, 1, ("if not %s(%s) then"):format(requestPassValidator, join(passVarsForValidation)))
+                    addLine(lines, 2, ("ReportError(%q)"):format(info.fullName .. " passthrough arguments are missing or invalid; message dropped"))
+                    addLine(lines, 2, "return nextOffset")
+                    addLine(lines, 1, "end")
                 end
 
                 if isServer and message.rate ~= nil and message.compression ~= nil then

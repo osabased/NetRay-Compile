@@ -173,6 +173,8 @@ event Example {
 - `passthrough`: Treated as `any`.
 - `passthrough <TypeName>`: Checked via `typeof` or `IsA` if validation is on.
 
+Passthrough values travel as the remote call's own arguments, after the batch buffer, in the order their messages were queued. A batch flushes early rather than carry more than 4096 of them.
+
 ::: warning Performance
 Passthrough values are **not** optimized by NetRay. They use standard Roblox serialization logic and cost.
 :::
