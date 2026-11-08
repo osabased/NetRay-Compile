@@ -1856,7 +1856,7 @@ end)
             addLine(lines, 1, "if responseCount < 1 then")
             emitError(lines, 2, validateLevel, info.fullName .. " function response missing payload", "ERR_SCHEMA")
             addLine(lines, 1, "end")
-            if #passthroughReturnNames > 0 then
+            if returnNeedsPassValidation then
                 addLine(lines, 1, "local responsePassCount = responseCount - 1")
             end
 
