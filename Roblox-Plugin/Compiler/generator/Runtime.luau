@@ -66,114 +66,177 @@ local canEmitFlatTopLevelSize = Emitters.canEmitFlatTopLevelSize
 
 local EMPTY_PARAMS: { Ast.Param } = {}
 
-local function tokenPattern(name: string): string
-    return ("%%f[%%w_]%s%%f[^%%w_]"):format(name)
-end
+-- Initializers that can be dropped with their local without changing behavior: literals, empty tables, aliases.
+local PURE_INITIALIZERS = {
+    "^%-?[%d%.]+$",
+    "^%-?math%.huge$",
+    '^"[^"]*"$',
+    "^nil$",
+    "^{}$",
+    "^{} :: [%w_]+$",
+    "^table%.create%([%w_]+%)$",
+    "^table%.create%([%w_]+, [%w_]+%)$",
+    '^setmetatable%({}, { __mode = "k" }%)$',
+    "^[%a_][%w_]*$",
+    "^[%a_][%w_]*%.[%a_][%w_]*$",
+}
 
-local function countTokenUsages(lines: { string }, name: string): number
-    local pattern = tokenPattern(name)
-    local count = 0
-    for index = 1, #lines do
-        if string.find(lines[index], pattern) then
-            count += 1
+local function isPureInitializer(expression: string): boolean
+    for _, pattern in PURE_INITIALIZERS do
+        if string.match(expression, pattern) then
+            return true
         end
     end
-    return count
+    return false
 end
 
-local function removeLocalAliasLine(lines: { string }, name: string)
-    local pattern = ("^local %s = "):format(name)
-    for index = #lines, 1, -1 do
-        if string.match(lines[index], pattern) then
-            table.remove(lines, index)
-            return
+local function countTokens(lines: { string }): { [string]: number }
+    local counts: { [string]: number } = {}
+    for _, line in lines do
+        for position, token in string.gmatch(line, "()([%a_][%w_]*)") do
+            -- `a.b` and `a:b` name fields, not locals; `a..b` still names b.
+            local before = string.sub(line, position - 2, position - 1)
+            local isField = string.match(before, "[^%.][%.:]$") ~= nil or before == "." or before == ":"
+            if not isField then
+                counts[token] = (counts[token] or 0) + 1
+            end
         end
     end
+    return counts
 end
 
-local function removeFunctionBlock(lines: { string }, name: string)
-    local startIndex: number? = nil
-    local startPattern = ("^local function %s%%("):format(name)
-    for index = 1, #lines do
-        if string.match(lines[index], startPattern) then
-            startIndex = index
-            break
+-- Generated blocks close with `end` at the indentation that opened them.
+local function findBlockEnd(lines: { string }, startIndex: number, indentation: string): number?
+    for index = startIndex + 1, #lines do
+        local line = lines[index]
+        if string.sub(line, 1, #indentation) == indentation and string.match(string.sub(line, #indentation + 1), "^end[%),]*$") then
+            return index
         end
     end
-    if startIndex == nil then
-        return
-    end
+    return nil
+end
 
+-- Returns the parameter list of a multi-line function header, or nil when the line opens no function body.
+local function functionHeaderParams(line: string): (string?, number?, number?)
+    local openIndex = string.find(line, "%f[%w_]function%f[^%w_][%w_%.:%s]*%(")
+    if openIndex == nil or string.find(line, "end[%),]*$") then
+        return nil
+    end
+    local first = (string.find(line, "(", openIndex, true) :: number) + 1
     local depth = 1
-    local endIndex = startIndex
-    while endIndex < #lines and depth > 0 do
-        endIndex += 1
-        local trimmed = string.gsub(lines[endIndex], "^%s+", "")
-        if string.match(trimmed, "^if .+ then$") or string.match(trimmed, "^for .+ do$") or string.match(trimmed, "^while .+ do$") or trimmed == "repeat" then
+    for index = first, #line do
+        local char = string.sub(line, index, index)
+        if char == "(" then
             depth += 1
-        elseif trimmed == "end" or string.match(trimmed, "^until ") then
+        elseif char == ")" then
             depth -= 1
+            if depth == 0 then
+                return string.sub(line, first, index - 1), first, index - 1
+            end
         end
     end
+    return nil
+end
 
-    for index = endIndex, startIndex, -1 do
-        table.remove(lines, index)
+local function splitTopLevel(text: string): { string }
+    local parts: { string } = {}
+    local depth = 0
+    local start = 1
+    for index = 1, #text do
+        local char = string.sub(text, index, index)
+        if char == "(" or char == "{" then
+            depth += 1
+        elseif char == ")" or char == "}" then
+            depth -= 1
+        elseif char == "," and depth == 0 then
+            parts[#parts + 1] = string.sub(text, start, index - 1)
+            start = index + 1
+        end
     end
+    parts[#parts + 1] = string.sub(text, start)
+    return parts
+end
 
-    if startIndex <= #lines and lines[startIndex] == "" and startIndex > 1 and lines[startIndex - 1] == "" then
-        table.remove(lines, startIndex)
+-- Dispatch and decode functions share one positional signature per category, so a message that needs no budget or
+-- payload still receives them. Unused names get Luau's `_` prefix and an unused trailing `...` is dropped.
+local function markUnusedParameters(lines: { string })
+    for headerIndex, line in lines do
+        local loopIndent, loopVariable = string.match(line, "^(%s*)for ([%a_][%w_]*) = ")
+        if loopVariable ~= nil and string.sub(loopVariable, 1, 1) ~= "_" then
+            local closeIndex = findBlockEnd(lines, headerIndex, loopIndent)
+            if closeIndex ~= nil and countTokens({ table.concat(lines, " ", headerIndex + 1, closeIndex - 1) })[loopVariable] == nil then
+                lines[headerIndex] = string.gsub(line, "for " .. loopVariable .. " = ", "for _ = ", 1)
+            end
+            continue
+        end
+        local params, first, last = functionHeaderParams(line)
+        if params == nil or params == "" then
+            continue
+        end
+        local indentation = string.match(line, "^%s*") :: string
+        local closeIndex = findBlockEnd(lines, headerIndex, indentation)
+        if closeIndex == nil then
+            continue
+        end
+        local body = table.concat(lines, "\n", headerIndex + 1, closeIndex - 1)
+        local counts = countTokens({ body })
+        local parts = splitTopLevel(params)
+        local kept: { string } = {}
+        for partIndex, part in parts do
+            local trimmed = string.match(part, "^%s*(.-)%s*$") :: string
+            local name = string.match(trimmed, "^[%a_][%w_]*") or string.match(trimmed, "^%.%.%.") or trimmed
+            if name == "..." then
+                if partIndex < #parts or string.find(body, "...", 1, true) then
+                    kept[#kept + 1] = trimmed
+                end
+            elseif counts[name] == nil and string.sub(name, 1, 1) ~= "_" then
+                kept[#kept + 1] = "_" .. trimmed
+            else
+                kept[#kept + 1] = trimmed
+            end
+        end
+        lines[headerIndex] = string.sub(line, 1, (first :: number) - 1) .. table.concat(kept, ", ") .. string.sub(line, (last :: number) + 1)
     end
 end
 
+-- Emitters declare every helper a message might need; this drops the locals and local functions nothing references,
+-- repeating until removals stop exposing new ones (an unused encoder leaves its message id unused).
 local function pruneUnusedRuntimeSymbols(lines: { string })
-    if countTokenUsages(lines, "VarUIntSize") <= 1 then
-        removeFunctionBlock(lines, "VarUIntSize")
+    local split: { string } = {}
+    for _, line in lines do
+        for _, part in string.split(line, "\n") do
+            split[#split + 1] = part
+        end
     end
-    if countTokenUsages(lines, "WriteVarUInt") <= 1 then
-        removeFunctionBlock(lines, "WriteVarUInt")
-    end
-    if countTokenUsages(lines, "ReadVarUInt") <= 1 then
-        removeFunctionBlock(lines, "ReadVarUInt")
-    end
-    if countTokenUsages(lines, "writef16") <= 1 then
-        removeFunctionBlock(lines, "writef16")
-    end
-    if countTokenUsages(lines, "readf16") <= 1 then
-        removeFunctionBlock(lines, "readf16")
-    end
+    table.clear(lines)
+    table.move(split, 1, #split, 1, lines)
 
-    local aliases = {
-        "DEFAULT_BATCH_CAPACITY",
-        "ERR_PASS",
-        "writeu8",
-        "writei8",
-        "writeu16",
-        "writei16",
-        "writeu32",
-        "writei32",
-        "writef16",
-        "writef32",
-        "writef64",
-        "writestring",
-        "readu8",
-        "readi8",
-        "readu16",
-        "readi16",
-        "readu32",
-        "readi32",
-        "readf16",
-        "readf32",
-        "readf64",
-        "readstring",
-        "band",
-        "bor",
-        "rshift",
-        "lshift",
-    }
-    for index = 1, #aliases do
-        local alias = aliases[index]
-        if countTokenUsages(lines, alias) <= 1 then
-            removeLocalAliasLine(lines, alias)
+    local removed = true
+    while removed do
+        removed = false
+        local counts = countTokens(lines)
+        local index = 1
+        while index <= #lines do
+            local line = lines[index]
+            local functionIndent, functionName = string.match(line, "^(%s*)local function ([%a_][%w_]*)%(")
+            local localName, annotation, initializer = string.match(line, "^%s*local ([%a_][%w_]*)([^=]*) = (.+)$")
+            local lastIndex: number? = nil
+            if functionName ~= nil and counts[functionName] == 1 then
+                lastIndex = findBlockEnd(lines, index, functionIndent)
+            elseif localName ~= nil and counts[localName] == 1 and (annotation == "" or string.sub(annotation, 1, 1) == ":") and isPureInitializer(initializer) then
+                lastIndex = index
+            end
+            if lastIndex ~= nil then
+                for _ = index, lastIndex do
+                    table.remove(lines, index)
+                end
+                if lines[index] == "" and (index == 1 or lines[index - 1] == "") then
+                    table.remove(lines, index)
+                end
+                removed = true
+            else
+                index += 1
+            end
         end
     end
 end
@@ -248,15 +311,15 @@ local function FlushPREFIX()
     end]]
     flushSource = string.gsub(flushSource, "PREPARE_COMPRESSION", compressOutgoing and [[local compressedBodies = {}
     -- Each client batch starts a new history so rejected batches cannot desynchronize later ones.
-    local nextState = __nr_cloneCompressionState(nil)
+    local nextState: CompressionState? = __nr_cloneCompressionState(nil)
     local sourceOffset, compressedSize = 0, UPPER_CURSOR
     for index = 1, UPPER_QUEUE_SIZE do
         local id = UPPER_IDS[index]
         local recordEnd = UPPER_ENDS[index]
-        local widths = CompressionWidths[id]
+        local widths: FieldWidths? = CompressionWidths[id]
         if widths ~= nil then
             local body
-            body, nextState = __nr_compress(nextState, id, UPPER_ARENA, widths or nil, sourceOffset + ID_BYTES, recordEnd - sourceOffset - ID_BYTES)
+            body, nextState = __nr_compress(nextState, id, UPPER_ARENA, widths, sourceOffset + ID_BYTES, recordEnd - sourceOffset - ID_BYTES)
             compressedBodies[index] = body
             compressedSize += len(body) - (recordEnd - sourceOffset - ID_BYTES)
         end
@@ -341,15 +404,15 @@ local function emitEventListener(
     local upper = string.upper(prefix)
     if isServer then
         if maxPassArgs > 0 then
-            addLine(lines, 0, ("local function Receive%s(player, payload, passCountList, ...)"):format(prefix))
+            addLine(lines, 0, ("local function Receive%s(player: Player, payload: unknown, passCountList: unknown, ...: unknown)"):format(prefix))
         else
-            addLine(lines, 0, ("local function Receive%s(player, payload)"):format(prefix))
+            addLine(lines, 0, ("local function Receive%s(player: Player, payload: unknown)"):format(prefix))
         end
     else
         if maxPassArgs > 0 then
-            addLine(lines, 0, ("local function Receive%s(payload, passCountList, ...)"):format(prefix))
+            addLine(lines, 0, ("local function Receive%s(payload: unknown, passCountList: unknown, ...: unknown)"):format(prefix))
         else
-            addLine(lines, 0, ("local function Receive%s(payload)"):format(prefix))
+            addLine(lines, 0, ("local function Receive%s(payload: unknown)"):format(prefix))
         end
     end
     if isServer then
@@ -422,7 +485,7 @@ local function emitEventListener(
         addLine(lines, 3, "messageIndex += 1")
         addLine(lines, 3, "local passCount = 0")
         addLine(lines, 3, "if type(passCountList) == \"table\" then")
-        addLine(lines, 4, "local rawPassCount = passCountList[messageIndex]")
+        addLine(lines, 4, "local rawPassCount = (passCountList :: { unknown })[messageIndex]")
         addLine(lines, 4, "if type(rawPassCount) == \"number\" then")
         addLine(lines, 5, "passCount = rawPassCount")
         addLine(lines, 4, "end")
@@ -430,7 +493,7 @@ local function emitEventListener(
         for passIndex = 1, maxPassArgs do
             addLine(lines, 3, ("local messagePass%d = nil"):format(passIndex))
             addLine(lines, 3, ("if type(passTable%d) == \"table\" then"):format(passIndex))
-            addLine(lines, 4, ("messagePass%d = passTable%d[messageIndex]"):format(passIndex, passIndex))
+            addLine(lines, 4, ("messagePass%d = (passTable%d :: { unknown })[messageIndex]"):format(passIndex, passIndex))
             addLine(lines, 3, "end")
         end
     end
@@ -465,8 +528,7 @@ local function emitEventListener(
     addLine(lines, 1, "end")
     addLine(lines, 0, "end")
     addLine(lines, 0, ("%s.%s:Connect(function(...)"):format(remoteVar, isServer and "OnServerEvent" or "OnClientEvent"))
-    addLine(lines, 1, ("local ok, failure = pcall(Receive%s, ...)"):format(prefix))
-    addLine(lines, 1, "if not ok then ReportError(failure) end")
+    addLine(lines, 1, ("xpcall(Receive%s, ReportError, ...)"):format(prefix))
     addLine(lines, 0, "end)")
     addLine(lines, 0, "")
 end
@@ -535,7 +597,7 @@ local function emitCommonRuntimePreamble(lines: { string }, schema: Analyzer.Ana
     addLine(lines, 0, "")
 
     if isServer then
-        addLine(lines, 0, "local function FindOrCreateRemote(className, remoteName)")
+        addLine(lines, 0, "local function FindOrCreateRemote(className: string, remoteName: string): Instance")
         addLine(lines, 1, "local existing = ReplicatedStorage:FindFirstChild(remoteName)")
         addLine(lines, 1, "if existing ~= nil then")
         addLine(lines, 2, "if existing.ClassName ~= className then")
@@ -570,7 +632,7 @@ local function emitCommonRuntimePreamble(lines: { string }, schema: Analyzer.Ana
         addLine(lines, 0, ("local %s = %s"):format(name, limitLiteral(schema.limits[name])))
     end
     addLine(lines, 0, "local LastErrorTime = -math.huge")
-    addLine(lines, 0, "local function ReportError(message)")
+    addLine(lines, 0, "local function ReportError(message: unknown)")
     addLine(lines, 1, "local now = os.clock()")
     addLine(lines, 1, "if now - LastErrorTime >= 1 then LastErrorTime = now; warn(message) end")
     addLine(lines, 0, "end")
@@ -581,7 +643,7 @@ local function emitCommonRuntimePreamble(lines: { string }, schema: Analyzer.Ana
             if schema.limits[metric[2]] > 0 or schema.limits[metric[3]] > 0 then enabled = true end
         end
         addLine(lines, 0, "local ReceiveBudgets = setmetatable({}, { __mode = \"k\" })")
-        addLine(lines, 0, "local function Admit(player, byteCost, messageCost)")
+        addLine(lines, 0, "local function Admit(player: Player, byteCost: number?, messageCost: number): boolean")
         if enabled then
             addLine(lines, 1, "local now = os.clock()")
             addLine(lines, 1, "local state = ReceiveBudgets[player]")
@@ -612,7 +674,7 @@ local function emitCommonRuntimePreamble(lines: { string }, schema: Analyzer.Ana
     addLine(lines, 0, "local writei16 = buffer.writei16")
     addLine(lines, 0, "local writeu32 = buffer.writeu32")
     addLine(lines, 0, "local writei32 = buffer.writei32")
-    addLine(lines, 0, "local function writef16(payload, offset, value)")
+    addLine(lines, 0, "local function writef16(payload: buffer, offset: number, value: number)")
     addLine(lines, 1, "local sign = 0")
     addLine(lines, 1, "if value < 0 or (value == 0 and 1 / value < 0) then")
     addLine(lines, 2, "sign = 32768")
@@ -671,7 +733,7 @@ local function emitCommonRuntimePreamble(lines: { string }, schema: Analyzer.Ana
     addLine(lines, 0, "local readi16 = buffer.readi16")
     addLine(lines, 0, "local readu32 = buffer.readu32")
     addLine(lines, 0, "local readi32 = buffer.readi32")
-    addLine(lines, 0, "local function readf16(payload, offset)")
+    addLine(lines, 0, "local function readf16(payload: buffer, offset: number): number")
     addLine(lines, 1, "local bits = readu16(payload, offset)")
     addLine(lines, 1, "local sign = if bit32.band(bits, 32768) ~= 0 then -1 else 1")
     addLine(lines, 1, "local exp = bit32.band(bit32.rshift(bits, 10), 31)")
@@ -686,7 +748,7 @@ local function emitCommonRuntimePreamble(lines: { string }, schema: Analyzer.Ana
     addLine(lines, 2, "if mant == 0 then")
     addLine(lines, 3, "return sign * math.huge")
     addLine(lines, 2, "end")
-    addLine(lines, 2, "return 0 / 0")
+    addLine(lines, 2, "return math.huge * 0")
     addLine(lines, 1, "end")
     addLine(lines, 1, "return sign * (1 + mant / 1024) * (2 ^ (exp - 15))")
     addLine(lines, 0, "end")
@@ -721,21 +783,23 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
     }
 
     addLine(lines, 0, "local Types = require(script.Parent.Types)")
-    addLine(lines, 0, "type u8 = typeof(Types.u8)")
-    addLine(lines, 0, "type i8 = typeof(Types.i8)")
-    addLine(lines, 0, "type u16 = typeof(Types.u16)")
-    addLine(lines, 0, "type i16 = typeof(Types.i16)")
-    addLine(lines, 0, "type u32 = typeof(Types.u32)")
-    addLine(lines, 0, "type i32 = typeof(Types.i32)")
-    addLine(lines, 0, "type f16 = typeof(Types.f16)")
-    addLine(lines, 0, "type f32 = typeof(Types.f32)")
-    addLine(lines, 0, "type f64 = typeof(Types.f64)")
-    addLine(lines, 0, ("type NetRoot = typeof(Types.%s)"):format(isServer and "NetServer" or "NetClient"))
-    addLine(lines, 0, "type NetStats = typeof(Types.NetStats)")
-    addLine(lines, 0, "type Connection = typeof(Types.Connection)")
+    addLine(lines, 0, "type u8 = Types.u8")
+    addLine(lines, 0, "type i8 = Types.i8")
+    addLine(lines, 0, "type u16 = Types.u16")
+    addLine(lines, 0, "type i16 = Types.i16")
+    addLine(lines, 0, "type u32 = Types.u32")
+    addLine(lines, 0, "type i32 = Types.i32")
+    addLine(lines, 0, "type f16 = Types.f16")
+    addLine(lines, 0, "type f32 = Types.f32")
+    addLine(lines, 0, "type f64 = Types.f64")
+    addLine(lines, 0, ("type NetRoot = Types.%s"):format(isServer and "NetServer" or "NetClient"))
+    addLine(lines, 0, "type NetStats = Types.NetStats")
+    addLine(lines, 0, "type Connection = Types.Connection")
+    addLine(lines, 0, "type DecodeBudget = { remaining: number, compression: any }")
+    addLine(lines, 0, "type Dispatch = (...any) -> ...any")
     for structIndex = 1, #schema.structs do
         local structName = schema.structs[structIndex].name
-        addLine(lines, 0, ("type %s = typeof(Types.%s)"):format(structName, structName))
+        addLine(lines, 0, ("type %s = Types.%s"):format(structName, structName))
     end
     for messageIndex = 1, #messages do
         local messageInfo = messages[messageIndex]
@@ -743,8 +807,8 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
         local apiTypeName = isServer and messageServerApiTypeName(messageInfo.apiBase) or messageClientApiTypeName(messageInfo.apiBase)
         local callbackTypeName = isServer and messageServerCallbackTypeName(messageInfo.apiBase, message.category)
             or messageClientCallbackTypeName(messageInfo.apiBase, message.category)
-        addLine(lines, 0, ("type %s = typeof(Types.%s)"):format(apiTypeName, apiTypeName))
-        addLine(lines, 0, ("type %s = typeof(Types.%s)"):format(callbackTypeName, callbackTypeName))
+        addLine(lines, 0, ("type %s = Types.%s"):format(apiTypeName, apiTypeName))
+        addLine(lines, 0, ("type %s = Types.%s"):format(callbackTypeName, callbackTypeName))
     end
     addLine(lines, 0, "")
 
@@ -758,7 +822,7 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
     addLine(lines, 0, "local SEGMENT_MARKER_ID = 0")
     addLine(lines, 0, "")
 
-    addLine(lines, 0, "local function VarUIntSize(value)")
+    addLine(lines, 0, "local function VarUIntSize(value: number): number")
     addLine(lines, 1, "if value < 128 then return 1 end")
     addLine(lines, 1, "if value < 16384 then return 2 end")
     addLine(lines, 1, "if value < 2097152 then return 3 end")
@@ -766,7 +830,7 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
     addLine(lines, 1, "return 5")
     addLine(lines, 0, "end")
     addLine(lines, 0, "")
-    addLine(lines, 0, "local function WriteVarUInt(payload, offset, value)")
+    addLine(lines, 0, "local function WriteVarUInt(payload: buffer, offset: number, value: number): number")
     addLine(lines, 1, "if value < 128 then")
     addLine(lines, 2, "writeu8(payload, offset, value)")
     addLine(lines, 2, "return offset + 1")
@@ -797,7 +861,7 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
     addLine(lines, 1, "return offset + 5")
     addLine(lines, 0, "end")
     addLine(lines, 0, "")
-    addLine(lines, 0, "local function ReadVarUInt(payload, payloadLength, offset)")
+    addLine(lines, 0, "local function ReadVarUInt(payload: buffer, payloadLength: number, offset: number): (number, number)")
     addLine(lines, 1, "local next1 = offset + 1")
     addLine(lines, 1, "if next1 > payloadLength then error(ERR_BOUNDS) end")
     addLine(lines, 1, "local b1 = readu8(payload, offset)")
@@ -845,7 +909,7 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
     local maxReliableId = 0
     local maxUnreliableId = 0
     local maxFunctionId = 0
-    addLine(lines, 0, "local APIs = {}")
+    addLine(lines, 0, "local APIs: { any } = {}")
     for index = 1, #messages do
         local info = messages[index]
         local category = info.message.category
@@ -871,18 +935,18 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
     addLine(lines, 0, ("local MAX_RELIABLE_ID = %d"):format(maxReliableId))
     addLine(lines, 0, ("local MAX_UNRELIABLE_ID = %d"):format(maxUnreliableId))
     addLine(lines, 0, ("local MAX_FUNCTION_ID = %d"):format(maxFunctionId))
-    addLine(lines, 0, "local RELIABLE_DISPATCH = table.create(MAX_RELIABLE_ID)")
-    addLine(lines, 0, "local UNRELIABLE_DISPATCH = table.create(MAX_UNRELIABLE_ID)")
-    addLine(lines, 0, "local RELIABLE_SKIP = table.create(MAX_RELIABLE_ID)")
-    addLine(lines, 0, "local UNRELIABLE_SKIP = table.create(MAX_UNRELIABLE_ID)")
-    addLine(lines, 0, "local FUNCTION_DISPATCH = table.create(MAX_FUNCTION_ID)")
+    addLine(lines, 0, "local RELIABLE_DISPATCH: { Dispatch } = table.create(MAX_RELIABLE_ID)")
+    addLine(lines, 0, "local UNRELIABLE_DISPATCH: { Dispatch } = table.create(MAX_UNRELIABLE_ID)")
+    addLine(lines, 0, "local RELIABLE_SKIP: { Dispatch } = table.create(MAX_RELIABLE_ID)")
+    addLine(lines, 0, "local UNRELIABLE_SKIP: { Dispatch } = table.create(MAX_UNRELIABLE_ID)")
+    addLine(lines, 0, "local FUNCTION_DISPATCH: { Dispatch } = table.create(MAX_FUNCTION_ID)")
     addLine(lines, 0, "")
 
     local hasCompression = false
     for _, info in messages do if info.message.compression ~= nil then hasCompression = true end end
     if hasCompression then
         Compression.emit(lines)
-        addLine(lines, 0, "local CompressionWidths = {}")
+        addLine(lines, 0, "local CompressionWidths: { [number]: FieldWidths } = {}")
         if not isServer then addLine(lines, 0, "local ReceiveCompression = nil") end
         for _, info in messages do
             if info.message.compression ~= nil then
@@ -922,7 +986,8 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
 
     if isServer then
         local targetedSource = [[
-local Targeted = {}
+type TargetQueue = { bytes: number, [number]: { any } }
+local Targeted: { [Player]: TargetQueue } = {}
 local TargetedBytes = 0
 local TargetedCount = 0
 COMPRESSION_DECL
@@ -931,7 +996,7 @@ local function FlushTargeted()
     Targeted = {}
     TargetedBytes, TargetedCount = 0, 0
     for player, queue in pending do
-        local records = {}
+        local records: { buffer } = {}
         local outputBytes = 0
         COMPRESSION_STATE
         for index = 1, #queue do
@@ -942,35 +1007,21 @@ local function FlushTargeted()
         end
         local payload = create(outputBytes)
         local offset = 0
-        local passCounts = {}
-        local passLists = table.create(MAX_PASS)
-        for passIndex = 1, MAX_PASS do passLists[passIndex] = {} end
+        PASS_SETUP
         for index = 1, #queue do
-            local message = queue[index]
             local bytes = len(records[index])
             copy(payload, offset, records[index], 0, bytes)
             offset += bytes
-            passCounts[index] = message[2] and message[2][1] or 0
-            for passIndex = 1, MAX_PASS do
-                local values = message[passIndex + 2]
-                passLists[passIndex][index] = values and values[1]
-            end
+            PASS_COLLECT
         end
-        local ok, failure
-        if MAX_PASS == 0 then
-            ok, failure = pcall(Reliable.FireClient, Reliable, player, payload)
-        else
-            ok, failure = pcall(Reliable.FireClient, Reliable, player, payload, passCounts, table.unpack(passLists, 1, MAX_PASS))
-        end
-        if ok then
-            COMPRESSION_COMMIT
-        else
+        local ok = xpcall(Reliable.FireClient, ReportError, Reliable, player, payload PASS_ARGS)
+        COMPRESSION_COMMIT
+        if not ok then
             RELIABLE_DROPPED += #queue
-            ReportError(failure)
         end
     end
 end
-local function QueueTarget(player, payload, ...)
+local function QueueTarget(player: Player, payload: buffer, ...: any): boolean
     FlushReliable()
     local bytes = len(payload) COMPRESSION_RESERVE
     if bytes > MaxBatchBytes then RELIABLE_DROPPED += 1; ReportError("NetRay outgoing message exceeds byte limit"); return false end
@@ -983,26 +1034,43 @@ local function QueueTarget(player, payload, ...)
     TargetedCount += 1
     return true
 end
-Players.PlayerRemoving:Connect(function(player)
+Players.PlayerRemoving:Connect(function(player: Player)
     local queue = Targeted[player]
     if queue then TargetedBytes -= queue.bytes; TargetedCount -= #queue; Targeted[player] = nil end
     COMPRESSION_REMOVE
 end)
 ]]
-        targetedSource = string.gsub(targetedSource, "MAX_PASS", tostring(schema.maxPassArgs.reliable))
+        -- With no passthrough arguments the per-pass tables and loops would be dead code, so they are left out.
+        local maxPass = schema.maxPassArgs.reliable
+        if maxPass > 0 then
+            targetedSource = string.gsub(targetedSource, "PASS_SETUP", ([[local passCounts: { number } = {}
+        local passLists: { { unknown } } = table.create(%d)
+        for passIndex = 1, %d do passLists[passIndex] = {} end]]):format(maxPass, maxPass))
+            targetedSource = string.gsub(targetedSource, "PASS_COLLECT", ([[local message = queue[index]
+            passCounts[index] = message[2] and message[2][1] or 0
+            for passIndex = 1, %d do
+                local values = message[passIndex + 2]
+                passLists[passIndex][index] = values and values[1]
+            end]]):format(maxPass))
+            targetedSource = string.gsub(targetedSource, " PASS_ARGS", (", passCounts, table.unpack(passLists, 1, %d)"):format(maxPass))
+        else
+            targetedSource = string.gsub(targetedSource, "PASS_SETUP", "")
+            targetedSource = string.gsub(targetedSource, "PASS_COLLECT", "")
+            targetedSource = string.gsub(targetedSource, " PASS_ARGS", "")
+        end
         targetedSource = string.gsub(targetedSource, "COMPRESSION_DECL", hasCompression and 'local TargetCompression = setmetatable({}, { __mode = "k" })' or "")
-        targetedSource = string.gsub(targetedSource, "COMPRESSION_STATE", hasCompression and "local nextState = __nr_cloneCompressionState(TargetCompression[player])" or "")
+        targetedSource = string.gsub(targetedSource, "COMPRESSION_STATE", hasCompression and "local nextState: CompressionState? = __nr_cloneCompressionState(TargetCompression[player])" or "")
         targetedSource = string.gsub(targetedSource, "COMPRESSION_RECORD", hasCompression and ([[local id = %s(record, 0)
-            local widths = CompressionWidths[id]
+            local widths: FieldWidths? = CompressionWidths[id]
             if widths ~= nil then
                 local encoded
-                encoded, nextState = __nr_compress(nextState, id, record, widths or nil, %d)
+                encoded, nextState = __nr_compress(nextState, id, record, widths, %d)
                 local framed = create(%d + len(encoded))
                 %s(framed, 0, id)
                 copy(framed, %d, encoded, 0, len(encoded))
                 record = framed
             end]]):format(reliableMessageIdWidth.reader, reliableMessageIdWidth.bytes, reliableMessageIdWidth.bytes, reliableMessageIdWidth.writer, reliableMessageIdWidth.bytes) or "")
-        targetedSource = string.gsub(targetedSource, "COMPRESSION_COMMIT", hasCompression and "TargetCompression[player] = nextState" or "")
+        targetedSource = string.gsub(targetedSource, "COMPRESSION_COMMIT", hasCompression and "if ok then TargetCompression[player] = nextState end" or "")
         targetedSource = string.gsub(targetedSource, "COMPRESSION_RESERVE", hasCompression and ("+ (CompressionWidths[%s(payload, 0)] ~= nil and 1 or 0)"):format(reliableMessageIdWidth.reader) or "")
         targetedSource = string.gsub(targetedSource, "COMPRESSION_REMOVE", hasCompression and "TargetCompression[player] = nil" or "")
         for _, line in string.split(targetedSource, "\n") do lines[#lines + 1] = line end
@@ -1576,19 +1644,19 @@ end)
                 local dispatchVar = message.category == "unreliable" and "UNRELIABLE_DISPATCH" or "RELIABLE_DISPATCH"
                 local signatureArgs: { string } = {}
                 if isServer then
-                    signatureArgs[#signatureArgs + 1] = "player"
+                    signatureArgs[#signatureArgs + 1] = "player: Player"
                 end
-                signatureArgs[#signatureArgs + 1] = "payload"
-                signatureArgs[#signatureArgs + 1] = "payloadLength"
-                signatureArgs[#signatureArgs + 1] = "offset"
+                signatureArgs[#signatureArgs + 1] = "payload: buffer"
+                signatureArgs[#signatureArgs + 1] = "payloadLength: number"
+                signatureArgs[#signatureArgs + 1] = "offset: number"
                 if isServer then
-                    signatureArgs[#signatureArgs + 1] = "decodeBudget"
+                    signatureArgs[#signatureArgs + 1] = "decodeBudget: DecodeBudget"
                 end
                 if categoryMaxPass > 0 then
-                    signatureArgs[#signatureArgs + 1] = "passCount"
+                    signatureArgs[#signatureArgs + 1] = "passCount: number"
                 end
                 for passIndex = 1, categoryMaxPass do
-                    signatureArgs[#signatureArgs + 1] = ("pass%d"):format(passIndex)
+                    signatureArgs[#signatureArgs + 1] = ("pass%d: unknown"):format(passIndex)
                 end
 
                 addLine(lines, 0, ("%s[%d] = function(%s)"):format(dispatchVar, message.id, join(signatureArgs)))
@@ -1634,7 +1702,7 @@ end)
                     addLine(lines, 2, ("%s = %s(payload, payloadLength, offset + 1%s)"):format(join(decodeResultVars), decodeRequestName, decodeBudgetArg))
                     addLine(lines, 2, ("ReceiveCompression = __nr_commitFull(ReceiveCompression, %d, payload, offset + 1, nextOffset, mode == 3)"):format(message.id))
                     addLine(lines, 1, "else")
-                    addLine(lines, 2, ("local body, incomingNext, nextState = __nr_decompress(ReceiveCompression, %d, payload, payloadLength, offset, CompressionWidths[%d] or nil)"):format(message.id, message.id))
+                    addLine(lines, 2, ("local body, incomingNext, nextState = __nr_decompress(ReceiveCompression, %d, payload, payloadLength, offset, CompressionWidths[%d])"):format(message.id, message.id))
                     if message.max ~= nil then
                         addLine(lines, 2, ("if len(body) > %d then error(ERR_BOUNDS) end"):format(message.max))
                     end
@@ -1858,15 +1926,15 @@ end)
 
             local signatureArgs: { string } = {}
             if isServer then
-                signatureArgs[#signatureArgs + 1] = "player"
+                signatureArgs[#signatureArgs + 1] = "player: Player"
             end
-            signatureArgs[#signatureArgs + 1] = "payload"
-            signatureArgs[#signatureArgs + 1] = "payloadLength"
+            signatureArgs[#signatureArgs + 1] = "payload: buffer"
+            signatureArgs[#signatureArgs + 1] = "payloadLength: number"
             if schema.maxPassArgs.Function > 0 then
-                signatureArgs[#signatureArgs + 1] = "passCount"
+                signatureArgs[#signatureArgs + 1] = "passCount: number"
             end
             for passIndex = 1, schema.maxPassArgs.Function do
-                signatureArgs[#signatureArgs + 1] = ("pass%d"):format(passIndex)
+                signatureArgs[#signatureArgs + 1] = ("pass%d: unknown"):format(passIndex)
             end
             addLine(lines, 0, ("FUNCTION_DISPATCH[%d] = function(%s)"):format(message.id, join(signatureArgs)))
             if requestNeedsPassValidation then
@@ -1907,7 +1975,8 @@ end)
                 local param = message.params[paramIndex]
                 if param.type.kind == "passthrough" then
                     callbackPassIndex += 1
-                    callbackArgs[#callbackArgs + 1] = ("pass%d"):format(callbackPassIndex)
+                    -- The passthrough validator has already checked the value against this type.
+                    callbackArgs[#callbackArgs + 1] = ("pass%d :: %s"):format(callbackPassIndex, toLuauType(param.type))
                 else
                     callbackSerialIndex += 1
                     local leafNames = requestDecodePlans[callbackSerialIndex].leafNames
@@ -2012,16 +2081,15 @@ end)
     addLine(lines, 0, "}")
     addLine(lines, 0, "")
 
-    local scopeLines = buildScopeTables(schema.root, 0, true, symbolByMessage)
+    local scopeLines = buildScopeTables(schema.root, 0, true, symbolByMessage, "NetRoot")
+    table.insert(scopeLines, #scopeLines, "    StepReplication = StepReplication,")
+    table.insert(scopeLines, #scopeLines, "    Stats = Stats,")
     appendLines(lines, scopeLines)
     addLine(lines, 0, "")
-    addLine(lines, 0, "Net.StepReplication = StepReplication")
-    addLine(lines, 0, "Net.Stats = Stats")
-    addLine(lines, 0, "local NetTyped: NetRoot = Net")
-    addLine(lines, 0, "")
-    addLine(lines, 0, "return table.freeze(NetTyped)")
+    addLine(lines, 0, ("return table.freeze(%s)"):format(schema.root.name))
 
     pruneUnusedRuntimeSymbols(lines)
+    markUnusedParameters(lines)
 
     return concat(lines)
 end

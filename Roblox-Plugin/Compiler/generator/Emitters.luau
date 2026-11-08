@@ -48,8 +48,15 @@ local buildDecodedParamPlans = Utilities.buildDecodedParamPlans
 local sanitizeIdentifier = Utilities.sanitizeIdentifier
 local getPassthroughTypeName = Utilities.getPassthroughTypeName
 local toLuauType = Utilities.toLuauType
+local luauTypeFieldKey = Utilities.luauTypeFieldKey
 
 local DEFAULT_F32_TYPE: Ast.Type = { kind = "f32" }
+
+-- luau-lsp refuses to compare a branded number (number & { __brand: "u16" }) read through an index, so range checks
+-- compare through a cast.
+local function asNumber(valueExpr: string): string
+    return ("(%s :: number)"):format(valueExpr)
+end
 
 local function minimumElementBytes(typeDef: Ast.Type, structByName: { [string]: Ast.Struct }): number
     local fixedBytes = computeFixedByteSize(typeDef, structByName, {})
@@ -143,12 +150,12 @@ end
 
 local function emitNumericBounds(lines, depth, typeDef, valueExpr, label, validateLevel)
     if typeDef.min ~= nil then
-        addLine(lines, depth, ("if not (%s >= %s) then"):format(valueExpr, tostring(typeDef.min)))
+        addLine(lines, depth, ("if not (%s >= %s) then"):format(asNumber(valueExpr), tostring(typeDef.min)))
         emitError(lines, depth + 1, validateLevel, label .. " below minimum or NaN", "ERR_SCHEMA")
         addLine(lines, depth, "end")
     end
     if typeDef.max ~= nil then
-        addLine(lines, depth, ("if not (%s <= %s) then"):format(valueExpr, tostring(typeDef.max)))
+        addLine(lines, depth, ("if not (%s <= %s) then"):format(asNumber(valueExpr), tostring(typeDef.max)))
         emitError(lines, depth + 1, validateLevel, label .. " above maximum or NaN", "ERR_SCHEMA")
         addLine(lines, depth, "end")
     end
@@ -221,15 +228,15 @@ end
 local function emitDecodeBudget(lines: { string }, params: { Ast.Param }, structByName: { [string]: Ast.Struct })
     for _, param in params do
         if hasCollection(param.type, structByName) then
-            addLine(lines, 1, "decodeBudget = decodeBudget or { remaining = MaxDecodeWork }")
+            addLine(lines, 1, "local workBudget = decodeBudget or { remaining = MaxDecodeWork }")
             return
         end
     end
 end
 
 local function emitDecodeWork(lines, depth, count)
-    addLine(lines, depth, ("decodeBudget.remaining -= %s"):format(count))
-    addLine(lines, depth, "if decodeBudget.remaining < 0 then error(ERR_BOUNDS) end")
+    addLine(lines, depth, ("workBudget.remaining -= %s"):format(count))
+    addLine(lines, depth, "if workBudget.remaining < 0 then error(ERR_BOUNDS) end")
 end
 
 local function emitSizeForType(
@@ -256,7 +263,7 @@ local function emitSizeForType(
                 addLine(lines, depth, ("if %s %% 1 ~= 0 then"):format(valueExpr))
                 emitError(lines, depth + 1, validateLevel, label .. " must be an integer", "ERR_SCHEMA")
                 addLine(lines, depth, "end")
-                addLine(lines, depth, ("if %s < %s or %s > %s then"):format(valueExpr, tostring(range.min), valueExpr, tostring(range.max)))
+                addLine(lines, depth, ("if %s < %s or %s > %s then"):format(asNumber(valueExpr), tostring(range.min), asNumber(valueExpr), tostring(range.max)))
                 emitError(lines, depth + 1, validateLevel, label .. " out of range", "ERR_SCHEMA")
                 addLine(lines, depth, "end")
             end
@@ -265,12 +272,12 @@ local function emitSizeForType(
             local minBound = typeDef.min
             local maxBound = typeDef.max
             if minBound ~= nil then
-                addLine(lines, depth, ("if not (%s >= %s) then"):format(valueExpr, tostring(minBound)))
+                addLine(lines, depth, ("if not (%s >= %s) then"):format(asNumber(valueExpr), tostring(minBound)))
                 emitError(lines, depth + 1, validateLevel, label .. " below minimum", "ERR_SCHEMA")
                 addLine(lines, depth, "end")
             end
             if maxBound ~= nil then
-                addLine(lines, depth, ("if not (%s <= %s) then"):format(valueExpr, tostring(maxBound)))
+                addLine(lines, depth, ("if not (%s <= %s) then"):format(asNumber(valueExpr), tostring(maxBound)))
                 emitError(lines, depth + 1, validateLevel, label .. " above maximum", "ERR_SCHEMA")
                 addLine(lines, depth, "end")
             end
@@ -376,10 +383,14 @@ local function emitSizeForType(
             emitError(lines, depth + 1, validateLevel, label .. " must be Vector3", "ERR_TYPE")
             addLine(lines, depth, "end")
         end
-        addLine(lines, depth, ("local %s = %s"):format(vectorVar, valueExpr))
         if isValidateBasicOrFull(validateLevel) then
+            local declarationIndex = #lines + 1
+            addLine(lines, depth, ("local %s = %s"):format(vectorVar, valueExpr))
             for _, component in { "X", "Y", "Z" } do
                 emitNumericBounds(lines, depth, componentType, vectorVar .. "." .. component, label, validateLevel)
+            end
+            if #lines == declarationIndex and minBound == nil and maxBound == nil then
+                table.remove(lines)
             end
         end
         if isValidateBasicOrFull(validateLevel) and (minBound ~= nil or maxBound ~= nil) then
@@ -505,14 +516,18 @@ local function emitSizeForType(
             addLine(lines, depth, "end")
         end
         local tagExpr = fieldAccessExpr(valueExpr, tagField)
+        -- Variants without fields add no size, so they only join the validity check.
+        local fieldlessChecks: { string } = {}
+        local opened = false
         for variantIndex = 1, #variants do
             local variant = variants[variantIndex]
             local fields = (variant.fields :: any) :: { Ast.Param }?
-            if variantIndex == 1 then
-                addLine(lines, depth, ("if %s == %q then"):format(tagExpr, variant.name))
-            else
-                addLine(lines, depth, ("elseif %s == %q then"):format(tagExpr, variant.name))
+            if fields == nil or #fields == 0 then
+                fieldlessChecks[#fieldlessChecks + 1] = ("%s ~= %q"):format(tagExpr, variant.name)
+                continue
             end
+            addLine(lines, depth, ("%s %s == %q then"):format(opened and "elseif" or "if", tagExpr, variant.name))
+            opened = true
             if fields ~= nil then
                 for fieldIndex = 1, #fields do
                     local field = fields[fieldIndex]
@@ -531,7 +546,11 @@ local function emitSizeForType(
                 end
             end
         end
-        addLine(lines, depth, "else")
+        if #fieldlessChecks == 0 then
+            addLine(lines, depth, "else")
+        else
+            addLine(lines, depth, ("%s %s then"):format(opened and "elseif" or "if", table.concat(fieldlessChecks, " and ")))
+        end
         emitError(lines, depth + 1, validateLevel, label .. " invalid tagged enum variant", "ERR_TAG")
         addLine(lines, depth, "end")
         return
@@ -622,7 +641,7 @@ local function emitSizeForType(
         end
         if isValidateFull(validateLevel) then
             addLine(lines, depth, ("for %s = 1, %s do"):format(indexVar, lenVar))
-            addLine(lines, depth + 1, ("if %s[%s] == nil then"):format(valueExpr, indexVar))
+            addLine(lines, depth + 1, ("if (%s[%s] :: %s?) == nil then"):format(valueExpr, indexVar, toLuauType(valueType)))
             emitError(lines, depth + 2, validateLevel, label .. " must be dense", "ERR_SCHEMA")
             addLine(lines, depth + 1, "end")
             addLine(lines, depth, "end")
@@ -714,7 +733,7 @@ local function emitSizeForType(
         end
         addLine(lines, depth, ("local %s = 0"):format(mapCount))
         cacheCollectionHint(stringLenHints, depth, "map", valueExpr, mapCount)
-        addLine(lines, depth, ("local %s, %s = next(%s, nil)"):format(mapKey, mapValue, valueExpr))
+        local headerIndex = #lines + 1
         addLine(lines, depth, ("while %s ~= nil do"):format(mapKey))
         addLine(lines, depth + 1, ("%s += 1"):format(mapCount))
         if declaredMax ~= nil then
@@ -723,8 +742,19 @@ local function emitSizeForType(
             addLine(lines, depth + 1, "end")
         end
         emitSizeForType(lines, state, keyType, mapKey, label .. " key", sizeVar, depth + 1, validateLevel, structByName, stringLenHints)
+        local valueStart = #lines + 1
         emitSizeForType(lines, state, valueType, mapValue, label .. " value", sizeVar, depth + 1, validateLevel, structByName, stringLenHints)
-        addLine(lines, depth + 1, ("%s, %s = next(%s, %s)"):format(mapKey, mapValue, valueExpr, mapKey))
+        -- A fixed-size value without validation adds its width without reading it, so the loop iterates keys only.
+        local readsValue = false
+        for lineIndex = valueStart, #lines do
+            if string.find(lines[lineIndex], "%f[%w_]" .. mapValue .. "%f[^%w_]") then
+                readsValue = true
+                break
+            end
+        end
+        local iterVars = if readsValue then ("%s, %s"):format(mapKey, mapValue) else mapKey
+        table.insert(lines, headerIndex, string.rep("    ", depth) .. ("local %s = next(%s, nil)"):format(iterVars, valueExpr))
+        addLine(lines, depth + 1, ("%s = next(%s, %s)"):format(iterVars, valueExpr, mapKey))
         addLine(lines, depth, "end")
         if declaredMin ~= nil then
             addLine(lines, depth, ("if %s < %d then"):format(mapCount, declaredMin))
@@ -1340,7 +1370,7 @@ local function emitReadFixedFromBlock(
         local elementBase = nextTemp(state, "fixedArrayElementBase")
         addLine(lines, depth, ("local %s = %s"):format(elementBase, readOffset))
         addLine(lines, depth, ("for %s = 1, %d do"):format(indexVar, fixedLength))
-        addLine(lines, depth + 1, ("local %s"):format(valueVar))
+        addLine(lines, depth + 1, ("local %s: %s"):format(valueVar, toLuauType(valueType)))
         emitReadFixedFromBlock(
             lines,
             state,
@@ -1368,7 +1398,13 @@ local function emitReadFixedFromBlock(
         for _, field in structDecl.fields do
             local reader = PRIMITIVE_READERS[normalizeTypeKind(field.type.kind)]
             if reader == nil then break end
-            literalFields[#literalFields + 1] = ("[%q] = %s(%s, %s)"):format(field.name, reader, payloadVar, offsetExpr(blockVar, numericOffset))
+            literalFields[#literalFields + 1] = ("[%q] = (%s(%s, %s) :: %s)"):format(
+                field.name,
+                reader,
+                payloadVar,
+                offsetExpr(blockVar, numericOffset),
+                toLuauType(field.type)
+            )
             numericOffset += PRIMITIVE_BYTES[normalizeTypeKind(field.type.kind)]
         end
         if #literalFields == #structDecl.fields then
@@ -1384,7 +1420,7 @@ local function emitReadFixedFromBlock(
         for fieldIndex = 1, #structDecl.fields do
             local field = structDecl.fields[fieldIndex]
             local fieldVar = nextTemp(state, "fixedStructField")
-            addLine(lines, depth, ("local %s"):format(fieldVar))
+            addLine(lines, depth, ("local %s: %s"):format(fieldVar, toLuauType(field.type)))
             emitReadFixedFromBlock(
                 lines,
                 state,
@@ -1739,7 +1775,8 @@ local function emitReadForType(
         emitError(lines, depth + 1, validateLevel, label .. " out of bounds", "ERR_BOUNDS")
         addLine(lines, depth, "end")
         addLine(lines, depth, ("local %s = %s(%s, %s)"):format(tagIndex, widthInfo.reader, payloadVar, offsetVar))
-        addLine(lines, depth, ("local %s = {}"):format(taggedVar))
+        -- Each branch builds its variant as one literal so it checks against the enum's union type.
+        addLine(lines, depth, ("local %s: %s"):format(taggedVar, toLuauType(typeDef)))
         addLine(lines, depth, ("%s = %s"):format(offsetVar, tagNext))
         for variantIndex = 1, #variants do
             local variant = variants[variantIndex]
@@ -1749,12 +1786,12 @@ local function emitReadForType(
             else
                 addLine(lines, depth, ("elseif %s == %d then"):format(tagIndex, variantIndex - 1))
             end
-            addLine(lines, depth + 1, ("%s[%q] = %q"):format(taggedVar, tagField, variant.name))
+            local entries = { ("%s = %q"):format(luauTypeFieldKey(tagField), variant.name) }
             if fields ~= nil then
                 for fieldIndex = 1, #fields do
                     local field = fields[fieldIndex]
                     local fieldVar = nextTemp(state, "taggedField")
-                    addLine(lines, depth + 1, ("local %s"):format(fieldVar))
+                    addLine(lines, depth + 1, ("local %s: %s"):format(fieldVar, toLuauType(field.type)))
                     emitReadForType(
                         lines,
                         state,
@@ -1768,9 +1805,10 @@ local function emitReadForType(
                         validateLevel,
                         structByName
                     )
-                    addLine(lines, depth + 1, ("%s[%q] = %s"):format(taggedVar, field.name, fieldVar))
+                    entries[#entries + 1] = ("%s = %s"):format(luauTypeFieldKey(field.name), fieldVar)
                 end
             end
+            addLine(lines, depth + 1, ("%s = { %s }"):format(taggedVar, table.concat(entries, ", ")))
         end
         addLine(lines, depth, "else")
         emitError(lines, depth + 1, validateLevel, label .. " invalid tagged enum variant", "ERR_TAG")
@@ -1789,7 +1827,7 @@ local function emitReadForType(
         for fieldIndex = 1, #fields do
             local field = fields[fieldIndex]
             local fieldVar = nextTemp(state, "structField")
-            addLine(lines, depth, ("local %s"):format(fieldVar))
+            addLine(lines, depth, ("local %s: %s"):format(fieldVar, toLuauType(field.type)))
             emitReadForType(
                 lines,
                 state,
@@ -1925,7 +1963,7 @@ local function emitReadForType(
                 local elementBase = nextTemp(state, "arrayElementBase")
                 addLine(lines, depth, ("local %s = %s"):format(elementBase, arrayBlock))
                 addLine(lines, depth, ("for %s = 1, %s do"):format(indexVar, countVar))
-                addLine(lines, depth + 1, ("local %s"):format(valueVar))
+                addLine(lines, depth + 1, ("local %s: %s"):format(valueVar, toLuauType(valueType)))
                 emitReadFixedFromBlock(
                     lines,
                     state,
@@ -1957,7 +1995,7 @@ local function emitReadForType(
             addLine(lines, depth, ("%s = %s"):format(offsetVar, packedCursor))
         else
             addLine(lines, depth, ("for %s = 1, %s do"):format(indexVar, countVar))
-            addLine(lines, depth + 1, ("local %s"):format(valueVar))
+            addLine(lines, depth + 1, ("local %s: %s"):format(valueVar, toLuauType(valueType)))
             local elementSize = computeFixedByteSize(valueType, structByName, {})
             if elementSize ~= nil then
                 emitReadFixedFromBlock(lines, state, valueType, valueVar, label .. "[]", payloadVar, offsetVar, 0, depth + 1, validateLevel, structByName)
@@ -2013,9 +2051,9 @@ local function emitReadForType(
         emitDecodeWork(lines, depth, countVar .. " * 2")
         addLine(lines, depth, ("local %s = {}"):format(mapVar))
         addLine(lines, depth, ("for %s = 1, %s do"):format(indexVar, countVar))
-        addLine(lines, depth + 1, ("local %s"):format(keyVar))
+        addLine(lines, depth + 1, ("local %s: %s"):format(keyVar, toLuauType(keyType)))
         emitReadForType(lines, state, keyType, keyVar, label .. " key", payloadVar, payloadLengthVar, offsetVar, depth + 1, validateLevel, structByName)
-        addLine(lines, depth + 1, ("local %s"):format(valueVar))
+        addLine(lines, depth + 1, ("local %s: %s"):format(valueVar, toLuauType(valueType)))
         emitReadForType(lines, state, valueType, valueVar, label .. " value", payloadVar, payloadLengthVar, offsetVar, depth + 1, validateLevel, structByName)
         addLine(lines, depth + 1, ("%s[%s] = %s"):format(mapVar, keyVar, valueVar))
         addLine(lines, depth, "end")
@@ -2030,7 +2068,7 @@ local function emitReadForType(
         for fieldIndex = 1, #structDecl.fields do
             local field = structDecl.fields[fieldIndex]
             local fieldVar = nextTemp(state, "structField")
-            addLine(lines, depth, ("local %s"):format(fieldVar))
+            addLine(lines, depth, ("local %s: %s"):format(fieldVar, toLuauType(field.type)))
             emitReadForType(
                 lines,
                 state,
@@ -2273,14 +2311,18 @@ local function emitSkipForType(
         addLine(lines, depth, "end")
         addLine(lines, depth, ("local %s = %s(%s, %s)"):format(tagIndex, widthInfo.reader, payloadVar, offsetVar))
         addLine(lines, depth, ("%s = %s"):format(offsetVar, tagNext))
+        -- Variants without fields have nothing to skip, so they only join the validity check.
+        local fieldlessChecks: { string } = {}
+        local opened = false
         for variantIndex = 1, #variants do
             local variant = variants[variantIndex]
             local fields = (variant.fields :: any) :: { Ast.Param }?
-            if variantIndex == 1 then
-                addLine(lines, depth, ("if %s == %d then"):format(tagIndex, variantIndex - 1))
-            else
-                addLine(lines, depth, ("elseif %s == %d then"):format(tagIndex, variantIndex - 1))
+            if fields == nil or #fields == 0 then
+                fieldlessChecks[#fieldlessChecks + 1] = ("%s ~= %d"):format(tagIndex, variantIndex - 1)
+                continue
             end
+            addLine(lines, depth, ("%s %s == %d then"):format(opened and "elseif" or "if", tagIndex, variantIndex - 1))
+            opened = true
             if fields ~= nil then
                 for fieldIndex = 1, #fields do
                     local field = fields[fieldIndex]
@@ -2299,7 +2341,11 @@ local function emitSkipForType(
                 end
             end
         end
-        addLine(lines, depth, "else")
+        if #fieldlessChecks == 0 then
+            addLine(lines, depth, "else")
+        else
+            addLine(lines, depth, ("%s %s then"):format(opened and "elseif" or "if", table.concat(fieldlessChecks, " and ")))
+        end
         emitError(lines, depth + 1, validateLevel, label .. " invalid tagged enum variant", "ERR_TAG")
         addLine(lines, depth, "end")
         return
@@ -2609,7 +2655,7 @@ local function emitCanonicalSizeForType(
                 addLine(lines, depth, ("if %s %% 1 ~= 0 then"):format(valueExpr))
                 emitError(lines, depth + 1, validateLevel, label .. " must be an integer", "ERR_SCHEMA")
                 addLine(lines, depth, "end")
-                addLine(lines, depth, ("if %s < %s or %s > %s then"):format(valueExpr, tostring(range.min), valueExpr, tostring(range.max)))
+                addLine(lines, depth, ("if %s < %s or %s > %s then"):format(asNumber(valueExpr), tostring(range.min), asNumber(valueExpr), tostring(range.max)))
                 emitError(lines, depth + 1, validateLevel, label .. " out of range", "ERR_SCHEMA")
                 addLine(lines, depth, "end")
             end
@@ -2746,7 +2792,7 @@ local function emitCanonicalSizeForType(
         end
         if isValidateFull(validateLevel) then
             addLine(lines, depth, ("for %s = 1, %s do"):format(indexVar, lenVar))
-            addLine(lines, depth + 1, ("if %s[%s] == nil then"):format(valueExpr, indexVar))
+            addLine(lines, depth + 1, ("if (%s[%s] :: %s?) == nil then"):format(valueExpr, indexVar, toLuauType(valueType)))
             emitError(lines, depth + 2, validateLevel, label .. " must be dense", "ERR_SCHEMA")
             addLine(lines, depth + 1, "end")
             addLine(lines, depth, "end")
@@ -2838,7 +2884,7 @@ local function emitCanonicalSizeForType(
         end
         addLine(lines, depth, ("local %s = 0"):format(mapCount))
         cacheCollectionHint(stringLenHints, depth, "map", valueExpr, mapCount)
-        addLine(lines, depth, ("local %s, %s = next(%s, nil)"):format(mapKey, mapValue, valueExpr))
+        local headerIndex = #lines + 1
         addLine(lines, depth, ("while %s ~= nil do"):format(mapKey))
         addLine(lines, depth + 1, ("%s += 1"):format(mapCount))
         if declaredMax ~= nil then
@@ -2847,8 +2893,19 @@ local function emitCanonicalSizeForType(
             addLine(lines, depth + 1, "end")
         end
         emitSizeForType(lines, state, keyType, mapKey, label .. " key", varSizeVar, depth + 1, validateLevel, structByName, nil)
+        local valueStart = #lines + 1
         emitSizeForType(lines, state, valueType, mapValue, label .. " value", varSizeVar, depth + 1, validateLevel, structByName, nil)
-        addLine(lines, depth + 1, ("%s, %s = next(%s, %s)"):format(mapKey, mapValue, valueExpr, mapKey))
+        -- A fixed-size value without validation adds its width without reading it, so the loop iterates keys only.
+        local readsValue = false
+        for lineIndex = valueStart, #lines do
+            if string.find(lines[lineIndex], "%f[%w_]" .. mapValue .. "%f[^%w_]") then
+                readsValue = true
+                break
+            end
+        end
+        local iterVars = if readsValue then ("%s, %s"):format(mapKey, mapValue) else mapKey
+        table.insert(lines, headerIndex, string.rep("    ", depth) .. ("local %s = next(%s, nil)"):format(iterVars, valueExpr))
+        addLine(lines, depth + 1, ("%s = next(%s, %s)"):format(iterVars, valueExpr, mapKey))
         addLine(lines, depth, "end")
         if declaredMin ~= nil then
             addLine(lines, depth, ("if %s < %d then"):format(mapCount, declaredMin))
@@ -3415,7 +3472,7 @@ local function emitDecodeCanonicalDataForType(
                 local elementBase = nextTemp(state, "arrayElementBase")
                 addLine(lines, depth, ("local %s = %s"):format(elementBase, arrayBlock))
                 addLine(lines, depth, ("for %s = 1, %s do"):format(indexVar, countVar))
-                addLine(lines, depth + 1, ("local %s"):format(valueVar))
+                addLine(lines, depth + 1, ("local %s: %s"):format(valueVar, toLuauType(valueType)))
                 emitReadFixedFromBlock(
                     lines,
                     state,
@@ -3447,7 +3504,7 @@ local function emitDecodeCanonicalDataForType(
             addLine(lines, depth, ("%s = %s"):format(varVar, packedCursor))
         else
             addLine(lines, depth, ("for %s = 1, %s do"):format(indexVar, countVar))
-            addLine(lines, depth + 1, ("local %s"):format(valueVar))
+            addLine(lines, depth + 1, ("local %s: %s"):format(valueVar, toLuauType(valueType)))
             local elementSize = computeFixedByteSize(valueType, structByName, {})
             if elementSize ~= nil then
                 emitReadFixedFromBlock(lines, state, valueType, valueVar, label .. "[]", payloadVar, varVar, 0, depth + 1, validateLevel, structByName)
@@ -3477,9 +3534,9 @@ local function emitDecodeCanonicalDataForType(
         emitDecodeWork(lines, depth, countVar .. " * 2")
         addLine(lines, depth, ("local %s = {}"):format(mapVar))
         addLine(lines, depth, ("for %s = 1, %s do"):format(indexVar, countVar))
-        addLine(lines, depth + 1, ("local %s"):format(keyVar))
+        addLine(lines, depth + 1, ("local %s: %s"):format(keyVar, toLuauType(keyType)))
         emitReadForType(lines, state, keyType, keyVar, label .. " key", payloadVar, payloadLengthVar, varVar, depth + 1, validateLevel, structByName)
-        addLine(lines, depth + 1, ("local %s"):format(valueVar))
+        addLine(lines, depth + 1, ("local %s: %s"):format(valueVar, toLuauType(valueType)))
         emitReadForType(lines, state, valueType, valueVar, label .. " value", payloadVar, payloadLengthVar, varVar, depth + 1, validateLevel, structByName)
         addLine(lines, depth + 1, ("%s[%s] = %s"):format(mapVar, keyVar, valueVar))
         addLine(lines, depth, "end")
@@ -3494,7 +3551,7 @@ local function emitDecodeCanonicalDataForType(
         for fieldIndex = 1, #structDecl.fields do
             local field = structDecl.fields[fieldIndex]
             local fieldVar = nextTemp(state, "structField")
-            addLine(lines, depth, ("local %s"):format(fieldVar))
+            addLine(lines, depth, ("local %s: %s"):format(fieldVar, toLuauType(field.type)))
             emitDecodeCanonicalDataForType(
                 lines,
                 state,
@@ -3682,12 +3739,12 @@ local function emitPassthroughValidator(
     params: { Ast.Param },
     validateLevel: Analyzer.ValidateLevel
 )
-    local args: { string } = { "passCount" }
+    local args: { string } = { "passCount: number" }
     for index = 1, #params do
-        args[#args + 1] = ("pass%d"):format(index)
+        args[#args + 1] = ("pass%d: unknown"):format(index)
     end
 
-    addLine(lines, 0, ("local function %s(%s)"):format(functionName, join(args)))
+    addLine(lines, 0, ("local function %s(%s): boolean"):format(functionName, join(args)))
     if validateLevel == "Off" then
         addLine(lines, 1, "return true")
         addLine(lines, 0, "end")
@@ -3709,7 +3766,7 @@ local function emitPassthroughValidator(
             local typeVar = ("passType_%d"):format(index)
             addLine(lines, 1, ("local %s = typeof(%s)"):format(typeVar, passVar))
             addLine(lines, 1, ("if %s ~= %q then"):format(typeVar, typeName))
-            addLine(lines, 2, ("if %s ~= \"Instance\" or not %s:IsA(%q) then"):format(typeVar, passVar, typeName))
+            addLine(lines, 2, ("if %s ~= \"Instance\" or not (%s :: Instance):IsA(%q) then"):format(typeVar, passVar, typeName))
             addLine(lines, 3, "return false")
             addLine(lines, 2, "end")
             addLine(lines, 1, "end")
@@ -3852,7 +3909,7 @@ local function emitFlatSizeForType(
                 addLine(lines, 1, ("if %s %% 1 ~= 0 then"):format(valueExpr))
                 emitError(lines, 2, validateLevel, label .. " must be an integer", "ERR_SCHEMA")
                 addLine(lines, 1, "end")
-                addLine(lines, 1, ("if %s < %s or %s > %s then"):format(valueExpr, tostring(range.min), valueExpr, tostring(range.max)))
+                addLine(lines, 1, ("if %s < %s or %s > %s then"):format(asNumber(valueExpr), tostring(range.min), asNumber(valueExpr), tostring(range.max)))
                 emitError(lines, 2, validateLevel, label .. " out of range", "ERR_SCHEMA")
                 addLine(lines, 1, "end")
             end
@@ -4020,7 +4077,11 @@ local function emitCodecFunctions(
     if includeEncode then
         local encodeArgs = paramNames(params)
         local canUseFlatSize = (not usesCanonicalLayout) and canEmitFlatTopLevelSize(params, structByName)
-        addLine(lines, 0, ("local function %s(%s)"):format(encodeName, join(encodeArgs)))
+        local typedEncodeArgs: { string } = {}
+        for index = 1, #params do
+            typedEncodeArgs[index] = ("%s: %s"):format(encodeArgs[index], toLuauType(params[index].type))
+        end
+        addLine(lines, 0, ("local function %s(%s): buffer"):format(encodeName, join(typedEncodeArgs)))
         local sizeState: EmitState = { tempIndex = 0 }
         local stringLenHints: { [string]: string } = {}
 
@@ -4110,7 +4171,9 @@ local function emitCodecFunctions(
                 )
             end
         else
-            addLine(lines, 1, ("local offset = %d"):format(baseBytes))
+            if #params > 0 then
+                addLine(lines, 1, ("local offset = %d"):format(baseBytes))
+            end
             local writeState: EmitState = { tempIndex = sizeState.tempIndex }
             emitWriteParamsWithFixedBlocks(lines, writeState, params, encodeArgs, "payload", "offset", 1, structByName, stringLenHints)
         end
@@ -4121,7 +4184,7 @@ local function emitCodecFunctions(
     end
 
     if includeDecode then
-        addLine(lines, 0, ("local function %s(payload, payloadLength, offset, decodeBudget)"):format(decodeName))
+        addLine(lines, 0, ("local function %s(payload: buffer, payloadLength: number, offset: number, decodeBudget: DecodeBudget?)"):format(decodeName))
         emitDecodeBudget(lines, params, structByName)
 
         local decodeState: EmitState = { tempIndex = 0 }
@@ -4131,7 +4194,7 @@ local function emitCodecFunctions(
             local leaves = decodePlans[planIndex].leaves
             for leafIndex = 1, #leaves do
                 decodeLeaves[#decodeLeaves + 1] = leaves[leafIndex]
-                addLine(lines, 1, ("local %s"):format(leaves[leafIndex].targetName))
+                addLine(lines, 1, ("local %s: %s"):format(leaves[leafIndex].targetName, toLuauType(leaves[leafIndex].typeDef)))
             end
         end
         local decodeVars = collectDecodedLeafNames(decodePlans)
@@ -4281,7 +4344,7 @@ local function emitSkipFunction(
     local usesCanonicalLayout = paramsHaveVariableLength(params, structByName)
     local canonicalFixedSize = usesCanonicalLayout and fixedBytesForCanonicalParams(params, structByName) or 0
 
-    addLine(lines, 0, ("local function %s(payload, payloadLength, offset, decodeBudget)"):format(skipName))
+    addLine(lines, 0, ("local function %s(payload: buffer, payloadLength: number, offset: number, decodeBudget: DecodeBudget?)"):format(skipName))
     emitDecodeBudget(lines, params, structByName)
 
     local skipState: EmitState = { tempIndex = 0 }

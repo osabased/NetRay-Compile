@@ -384,8 +384,8 @@ local function generateTypes(schema: Analyzer.AnalyzedSchema): string
         local serverCallbackTypeName = messageServerCallbackTypeName(messageInfo.apiBase, message.category)
         local clientApiTypeName = messageClientApiTypeName(messageInfo.apiBase)
         local serverApiTypeName = messageServerApiTypeName(messageInfo.apiBase)
-        addLine(lines, 1, ("%s = ((function(...) end) :: any) :: %s,"):format(clientCallbackTypeName, clientCallbackTypeName))
-        addLine(lines, 1, ("%s = ((function(...) end) :: any) :: %s,"):format(serverCallbackTypeName, serverCallbackTypeName))
+        addLine(lines, 1, ("%s = ((function() end) :: any) :: %s,"):format(clientCallbackTypeName, clientCallbackTypeName))
+        addLine(lines, 1, ("%s = ((function() end) :: any) :: %s,"):format(serverCallbackTypeName, serverCallbackTypeName))
         addLine(lines, 1, ("%s = ({} :: any) :: %s,"):format(clientApiTypeName, clientApiTypeName))
         addLine(lines, 1, ("%s = ({} :: any) :: %s,"):format(serverApiTypeName, serverApiTypeName))
     end

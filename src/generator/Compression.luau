@@ -1,20 +1,32 @@
 --!strict
 -- Senders stage one cache copy per flush; receivers commit after codec validation.
 local SOURCE = [=[
+-- false marks a message compressed whole, without per-field deltas.
+type FieldWidths = { number } | false
+type CompressionState = { values: { [number]: buffer }, bytes: number, count: number, staged: boolean? }
+
 local __nr_repeatMarker = buffer.create(1)
 buffer.writeu8(__nr_repeatMarker, 0, 1)
 
-local function __nr_cloneCompressionState(state)
+local function __nr_cloneCompressionState(state: CompressionState?): CompressionState
     return { values = state and table.clone(state.values) or {}, bytes = state and state.bytes or 0, count = state and state.count or 0, staged = true }
 end
 
-local function __nr_copyBody(source, offset, length)
+local function __nr_copyBody(source: buffer, offset: number, length: number): buffer
     local result = buffer.create(length)
     buffer.copy(result, 0, source, offset, length)
     return result
 end
 
-local function __nr_commitFull(state, id, source, startOffset, endOffset, reset, owned)
+local function __nr_commitFull(
+    state: CompressionState?,
+    id: number,
+    source: buffer,
+    startOffset: number,
+    endOffset: number,
+    reset: boolean?,
+    owned: boolean?
+): CompressionState?
     local length = endOffset - startOffset
     local staged = state and state.staged
     if reset then state = nil end
@@ -33,7 +45,7 @@ local function __nr_commitFull(state, id, source, startOffset, endOffset, reset,
     return { values = values, bytes = bytes, count = count, staged = staged }
 end
 
-local function __nr_equalBytes(a, aOffset, b, bOffset, length)
+local function __nr_equalBytes(a: buffer, aOffset: number, b: buffer, bOffset: number, length: number): boolean
     local index = 0
     while index + 4 <= length do
         if buffer.readu32(a, aOffset + index) ~= buffer.readu32(b, bOffset + index) then return false end
@@ -46,8 +58,15 @@ local function __nr_equalBytes(a, aOffset, b, bOffset, length)
     return true
 end
 
-local function __nr_compress(state, id, body, widths, bodyOffset, bodyLength)
-    bodyOffset = bodyOffset or 0
+local function __nr_compress(
+    state: CompressionState?,
+    id: number,
+    body: buffer,
+    widths: FieldWidths?,
+    startOffset: number?,
+    bodyLength: number?
+): (buffer, CompressionState?)
+    local bodyOffset = startOffset or 0
     local length = bodyLength or (buffer.len(body) - bodyOffset)
     local previous = state and state.values[id]
     if previous and buffer.len(previous) == length and __nr_equalBytes(previous, 0, body, bodyOffset, length) then
@@ -57,7 +76,7 @@ local function __nr_compress(state, id, body, widths, bodyOffset, bodyLength)
     local nextState = __nr_commitFull(state, id, body, bodyOffset, bodyOffset + length, reset)
     if widths and previous and buffer.len(previous) == length and not reset then
         local maskBytes = math.ceil(#widths / 8)
-        local changed = {}
+        local changed: { [number]: boolean } = {}
         local offset = 0
         local encodedLength = 1 + maskBytes
         for index, width in widths do
@@ -90,7 +109,14 @@ local function __nr_compress(state, id, body, widths, bodyOffset, bodyLength)
     return encoded, nextState
 end
 
-local function __nr_decompress(state, id, payload, payloadLength, offset, widths)
+local function __nr_decompress(
+    state: CompressionState?,
+    id: number,
+    payload: buffer,
+    payloadLength: number,
+    offset: number,
+    widths: FieldWidths?
+): (buffer, number, CompressionState?)
     assert(offset < payloadLength, "Missing compression mode")
     local mode = buffer.readu8(payload, offset)
     local previous = state and state.values[id]
