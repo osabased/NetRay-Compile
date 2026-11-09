@@ -1,7 +1,7 @@
 --!strict
 -- Name: Runtime
 -- Purpose: Runtime code generation (queues, listeners, dispatch, preamble)
-local Version = "0.2.0+osa.2"
+local Version = "0.2.0+osa.3"
 local Ast = require(script.Parent.Parent.idl.Ast)
 local Analyzer = require(script.Parent.Parent.idl.Analyzer)
 local Types = require(script.Parent.Types)
