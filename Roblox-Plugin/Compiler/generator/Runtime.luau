@@ -1523,7 +1523,9 @@ end)
             if canEmitOn then
                 if eventIsPolling then
                     local iterReturns = pollingReturnTypes(callbackArgTypes)
-                    local emptyReturns: { string } = table.create(#callbackArgTypes + 1, "nil")
+                    -- The loop stops at the nil index, so the values after it are never read and need no real value.
+                    local emptyReturns: { string } = table.create(#callbackArgTypes, "nil :: any")
+                    table.insert(emptyReturns, 1, "nil")
                     addLine(lines, 0, ("function %s.Iter(): () -> (%s)"):format(symbol, iterReturns))
                     addLine(lines, 1, ("return function(): (%s)"):format(iterReturns))
                     addLine(lines, 2, ("local __nr_head = %s"):format(pollingHeadName))
