@@ -266,8 +266,8 @@ local function emitQueue(
         addLine(lines, 0, ("local %s_PASS_VALUES: { unknown } = table.create(DEFAULT_BATCH_CAPACITY)"):format(upper))
         addLine(lines, 0, ("local %s_PASS_SIZE = 0"):format(upper))
     end
-    addLine(lines, 0, ("local %s_ENDS = {}"):format(upper))
-    addLine(lines, 0, ("local %s_IDS = {}"):format(upper))
+    addLine(lines, 0, ("local %s_ENDS: { number } = {}"):format(upper))
+    addLine(lines, 0, ("local %s_IDS: { number } = {}"):format(upper))
     local flushSource = [[
 local function FlushPREFIX()
     if UPPER_QUEUE_SIZE == 0 then return end
@@ -919,8 +919,6 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
     addLine(lines, 0, ("local MAX_FUNCTION_ID = %d"):format(maxFunctionId))
     addLine(lines, 0, "local RELIABLE_DISPATCH = table.create(MAX_RELIABLE_ID) :: { Dispatch }")
     addLine(lines, 0, "local UNRELIABLE_DISPATCH = table.create(MAX_UNRELIABLE_ID) :: { Dispatch }")
-    addLine(lines, 0, "local RELIABLE_SKIP = table.create(MAX_RELIABLE_ID) :: { Dispatch }")
-    addLine(lines, 0, "local UNRELIABLE_SKIP = table.create(MAX_UNRELIABLE_ID) :: { Dispatch }")
     addLine(lines, 0, "local FUNCTION_DISPATCH = table.create(MAX_FUNCTION_ID) :: { Dispatch }")
     if schema.maxPassArgs.reliable > 0 or schema.maxPassArgs.unreliable > 0 then
         -- Passthrough values travel as the remote call's own arguments; Studio delivered 4096 of them in one call.
@@ -1059,7 +1057,7 @@ end)
             targetedSource = string.gsub(targetedSource, "PASS_COLLECT", "")
             targetedSource = string.gsub(targetedSource, " PASS_ARGS", "")
         end
-        targetedSource = string.gsub(targetedSource, "COMPRESSION_DECL", hasCompression and 'local TargetCompression = setmetatable({}, { __mode = "k" })' or "")
+        targetedSource = string.gsub(targetedSource, "COMPRESSION_DECL", hasCompression and 'local TargetCompression: { [Player]: CompressionState } = setmetatable({}, { __mode = "k" })' or "")
         targetedSource = string.gsub(targetedSource, "COMPRESSION_STATE", hasCompression and "local nextState: CompressionState? = __nr_cloneCompressionState(TargetCompression[player])" or "")
         targetedSource = string.gsub(targetedSource, "COMPRESSION_RECORD", hasCompression and ([[local id = %s(record, 0)
             local widths: FieldWidths? = CompressionWidths[id]
@@ -1216,7 +1214,7 @@ end)
             local pollingTailName = "PollTail_" .. symbol
             local pollingArgNames: { string } = {}
             if canEmitOn and isServer and message.rate ~= nil then
-                addLine(lines, 0, 'local EventBudgets = setmetatable({}, { __mode = "k" })')
+                addLine(lines, 0, 'local EventBudgets: { [Player]: { time: number, tokens: number } } = setmetatable({}, { __mode = "k" })')
             end
             if canEmitOn and eventIsPolling then
                 addLine(lines, 0, ("local %s = 1"):format(pollingHeadName))
@@ -1238,8 +1236,6 @@ end)
 
             if canEmitFire or (canEmitOn and (message.max ~= nil or (isServer and message.rate ~= nil))) then
                 emitSkipFunction(lines, skipName, info.serializedParams, info.fullName, validateLevel, schema.structByName)
-                local skipDispatchVar = message.category == "unreliable" and "UNRELIABLE_SKIP" or "RELIABLE_SKIP"
-                addLine(lines, 0, ("%s[%d] = %s"):format(skipDispatchVar, message.id, skipName))
                 addLine(lines, 0, "")
             end
 
