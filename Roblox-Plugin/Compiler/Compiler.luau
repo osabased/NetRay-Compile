@@ -20,7 +20,7 @@ export type CompileResult = {
 	},
 }
 
-local VERSION = "0.2.0+osa.3"
+local VERSION = "0.2.0+osa.4"
 
 local FORBIDDEN_PATTERNS = {
 	"string.pack",
