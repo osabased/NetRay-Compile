@@ -40,14 +40,14 @@ local getStringBoundComment = Utilities.getStringBoundComment
 local indent = Utilities.indent
 
 local function pollingIteratorType(params: { Ast.Param }, includePlayer: boolean): string
-    local returns = { "number?" }
+    local argTypes: { string } = {}
     if includePlayer then
-        returns[#returns + 1] = "Player?"
+        argTypes[#argTypes + 1] = "Player"
     end
     for index = 1, #params do
-        returns[#returns + 1] = ("(%s)?"):format(toLuauType(params[index].type))
+        argTypes[#argTypes + 1] = toLuauType(params[index].type)
     end
-    return ("Iter: () -> (() -> (%s)),"):format(join(returns))
+    return ("Iter: () -> (() -> (%s)),"):format(Utilities.pollingReturnTypes(argTypes))
 end
 
 local function emitTupleBoundsComment(lines: { string }, label: string, params: { Ast.Param })
@@ -147,27 +147,15 @@ local function generateTypes(schema: Analyzer.AnalyzedSchema): string
     addLine(lines, 0, "export type TypeBranding = \"Off\" | \"On\"")
     addLine(lines, 0, ("export type ActiveTypeBranding = %q"):format(typeBranding))
     addLine(lines, 0, "export type Brand<T, B> = T & { __brand: B }")
-    if typeBranding == "On" then
-        addLine(lines, 0, "export type u8 = Brand<number, \"u8\">")
-        addLine(lines, 0, "export type i8 = Brand<number, \"i8\">")
-        addLine(lines, 0, "export type u16 = Brand<number, \"u16\">")
-        addLine(lines, 0, "export type i16 = Brand<number, \"i16\">")
-        addLine(lines, 0, "export type u32 = Brand<number, \"u32\">")
-        addLine(lines, 0, "export type i32 = Brand<number, \"i32\">")
-        addLine(lines, 0, "export type f16 = Brand<number, \"f16\">")
-        addLine(lines, 0, "export type f32 = Brand<number, \"f32\">")
-        addLine(lines, 0, "export type f64 = Brand<number, \"f64\">")
-    else
-        addLine(lines, 0, "export type u8 = number")
-        addLine(lines, 0, "export type i8 = number")
-        addLine(lines, 0, "export type u16 = number")
-        addLine(lines, 0, "export type i16 = number")
-        addLine(lines, 0, "export type u32 = number")
-        addLine(lines, 0, "export type i32 = number")
-        addLine(lines, 0, "export type f16 = number")
-        addLine(lines, 0, "export type f32 = number")
-        addLine(lines, 0, "export type f64 = number")
-    end
+    addLine(lines, 0, "export type u8 = number")
+    addLine(lines, 0, "export type i8 = number")
+    addLine(lines, 0, "export type u16 = number")
+    addLine(lines, 0, "export type i16 = number")
+    addLine(lines, 0, "export type u32 = number")
+    addLine(lines, 0, "export type i32 = number")
+    addLine(lines, 0, "export type f16 = number")
+    addLine(lines, 0, "export type f32 = number")
+    addLine(lines, 0, "export type f64 = number")
     addLine(lines, 0, "")
 
     addLine(lines, 0, "export type Connection = {")

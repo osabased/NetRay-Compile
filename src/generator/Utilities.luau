@@ -232,7 +232,11 @@ local function resolveTypeBranding(options: { Ast.Option }): TypeBrandingMode
         if string.lower(option.name) == "typebranding" then
             local lowered = string.lower(option.value)
             if lowered == "on" then
-                return "On"
+                -- Luau's new type solver has no nominal subtype of number: a cast from number to a branded
+                -- intersection is rejected, and arithmetic on one has no overload.
+                error(
+                    "TypeBranding = On is not supported: Luau's new type solver can't create or do arithmetic on branded numbers. Remove the option or set it to Off."
+                )
             end
             if lowered == "off" then
                 return "Off"
@@ -417,6 +421,21 @@ local function tupleTypeExpr(params: { Ast.Param }): string
         return ("() -> %s"):format(chunks[1])
     end
     return ("() -> (%s)"):format(join(chunks))
+end
+
+-- Return types of a polling iterator: the sequence number, then each callback value. Every value is optional
+-- because the iterator signals the end of the queue with nil.
+local function pollingReturnTypes(argTypes: { string }): string
+    local returns: { string } = { "number?" }
+    for index = 1, #argTypes do
+        local argType = argTypes[index]
+        if string.match(argType, "^[%w_%.]+$") ~= nil then
+            returns[#returns + 1] = argType .. "?"
+        else
+            returns[#returns + 1] = ("(%s)?"):format(argType)
+        end
+    end
+    return join(returns)
 end
 
 local function callbackTypeExpr(params: { Ast.Param }, includePlayer: boolean, returns: { Ast.Param }): string
@@ -970,6 +989,7 @@ return {
     resolveTypeBranding = resolveTypeBranding,
     resolveDecodeStruct = resolveDecodeStruct,
     toLuauType = toLuauType,
+    pollingReturnTypes = pollingReturnTypes,
     typedParamList = typedParamList,
     returnTypeExpr = returnTypeExpr,
     tupleTypeExpr = tupleTypeExpr,
