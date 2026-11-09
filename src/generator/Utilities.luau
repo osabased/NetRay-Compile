@@ -425,15 +425,12 @@ end
 
 -- Return types of a polling iterator: the sequence number, then each callback value. Every value is optional
 -- because the iterator signals the end of the queue with nil.
+-- Typed like Luau's `next`: only the index is optional, since a generic for loop stops at a nil first value and never
+-- reads the rest. A loop body can then use the values without a nil check.
 local function pollingReturnTypes(argTypes: { string }): string
     local returns: { string } = { "number?" }
     for index = 1, #argTypes do
-        local argType = argTypes[index]
-        if string.match(argType, "^[%w_%.]+$") ~= nil then
-            returns[#returns + 1] = argType .. "?"
-        else
-            returns[#returns + 1] = ("(%s)?"):format(argType)
-        end
+        returns[#returns + 1] = argTypes[index]
     end
     return join(returns)
 end
