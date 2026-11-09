@@ -1350,7 +1350,7 @@ local function emitReadFixedFromBlock(
         local valueKind = normalizeTypeKind(valueType.kind)
         local arrayVar = nextTemp(state, "fixedArrayValues")
         emitDecodeWork(lines, depth, tostring(fixedLength))
-        addLine(lines, depth, ("local %s = table.create(%d)"):format(arrayVar, fixedLength))
+        addLine(lines, depth, ("local %s = table.create(%d) :: { %s }"):format(arrayVar, fixedLength, toLuauType(valueType)))
 
         if valueKind == "bool" then
             local packedCursor = nextTemp(state, "fixedArrayPackedCursor")
@@ -1705,28 +1705,35 @@ local function emitReadForType(
         addLine(lines, depth, ("if %s > %s then"):format(nextOffset, payloadLengthVar))
         emitError(lines, depth + 1, validateLevel, label .. " out of bounds", "ERR_BOUNDS")
         addLine(lines, depth, "end")
-        addLine(lines, depth, ("local %s = %s(%s, %s)"):format(indexVar, widthInfo.reader, payloadVar, offsetVar))
+        if #values > 1 or isValidateBasicOrFull(validateLevel) then
+            addLine(lines, depth, ("local %s = %s(%s, %s)"):format(indexVar, widthInfo.reader, payloadVar, offsetVar))
+        end
         addLine(lines, depth, ("%s = %s"):format(offsetVar, nextOffset))
         if isValidateBasicOrFull(validateLevel) then
             addLine(lines, depth, ("if %s > %d then"):format(indexVar, #values - 1))
             emitError(lines, depth + 1, validateLevel, label .. " invalid enum index", "ERR_TAG")
             addLine(lines, depth, "end")
         end
-        for valueIndex = 1, #values do
-            if valueIndex == 1 then
-                addLine(lines, depth, ("if %s == %d then"):format(indexVar, valueIndex - 1))
-            else
-                addLine(lines, depth, ("elseif %s == %d then"):format(indexVar, valueIndex - 1))
-            end
-            addLine(lines, depth + 1, ("%s = %q"):format(targetVar, values[valueIndex]))
-        end
-        addLine(lines, depth, "else")
         if isValidateBasicOrFull(validateLevel) then
+            for valueIndex = 1, #values do
+                addLine(lines, depth, ("%s %s == %d then"):format(valueIndex == 1 and "if" or "elseif", indexVar, valueIndex - 1))
+                addLine(lines, depth + 1, ("%s = %q"):format(targetVar, values[valueIndex]))
+            end
+            addLine(lines, depth, "else")
             emitError(lines, depth + 1, validateLevel, label .. " invalid enum index", "ERR_TAG")
+            addLine(lines, depth, "end")
+        elseif #values == 1 then
+            addLine(lines, depth, ("%s = %q"):format(targetVar, values[1]))
         else
+            -- Without validation an unknown index decodes as the first value, so that value is the else branch.
+            for valueIndex = 2, #values do
+                addLine(lines, depth, ("%s %s == %d then"):format(valueIndex == 2 and "if" or "elseif", indexVar, valueIndex - 1))
+                addLine(lines, depth + 1, ("%s = %q"):format(targetVar, values[valueIndex]))
+            end
+            addLine(lines, depth, "else")
             addLine(lines, depth + 1, ("%s = %q"):format(targetVar, values[1]))
+            addLine(lines, depth, "end")
         end
-        addLine(lines, depth, "end")
         return
     end
 
@@ -1937,7 +1944,7 @@ local function emitReadForType(
         end
         emitArrayAllocationCheck(lines, depth, typeDef, valueType, countVar, offsetVar, payloadLengthVar, structByName)
         emitDecodeWork(lines, depth, tostring(countVar))
-        addLine(lines, depth, ("local %s = table.create(%s)"):format(arrayVar, countVar))
+        addLine(lines, depth, ("local %s = table.create(%s) :: { %s }"):format(arrayVar, countVar, toLuauType(valueType)))
         if fixedArrayTotalSize ~= nil then
             local arrayBlock = nextTemp(state, "arrayFixedBlock")
             local arrayBlockNext = nextTemp(state, "arrayFixedBlockNext")
@@ -3446,7 +3453,7 @@ local function emitDecodeCanonicalDataForType(
         local valueVar = nextTemp(state, "arrayValue")
         emitArrayAllocationCheck(lines, depth, typeDef, valueType, countVar, varVar, payloadLengthVar, structByName)
         emitDecodeWork(lines, depth, tostring(countVar))
-        addLine(lines, depth, ("local %s = table.create(%s)"):format(arrayVar, countVar))
+        addLine(lines, depth, ("local %s = table.create(%s) :: { %s }"):format(arrayVar, countVar, toLuauType(valueType)))
         if fixedArrayTotalSize ~= nil then
             local arrayBlock = nextTemp(state, "arrayFixedBlock")
             local arrayBlockNext = nextTemp(state, "arrayFixedBlockNext")
@@ -3762,13 +3769,24 @@ local function emitPassthroughValidator(
         addLine(lines, 2, "return false")
         addLine(lines, 1, "end")
 
-        if typeName ~= "any" then
-            local typeVar = ("passType_%d"):format(index)
-            addLine(lines, 1, ("local %s = typeof(%s)"):format(typeVar, passVar))
-            addLine(lines, 1, ("if %s ~= %q then"):format(typeVar, typeName))
-            addLine(lines, 2, ("if %s ~= \"Instance\" or not (%s :: Instance):IsA(%q) then"):format(typeVar, passVar, typeName))
-            addLine(lines, 3, "return false")
-            addLine(lines, 2, "end")
+        -- A type name is either a Roblox data type that typeof reports, or an Instance class checked with IsA.
+        if typeName == "Instance" then
+            addLine(lines, 1, ("if typeof(%s) ~= \"Instance\" then"):format(passVar))
+            addLine(lines, 2, "return false")
+            addLine(lines, 1, "end")
+        elseif typeName ~= "any" then
+            addLine(
+                lines,
+                1,
+                ("if not (typeof(%s) == %q or (typeof(%s) == \"Instance\" and %s:IsA(%q))) then"):format(
+                    passVar,
+                    typeName,
+                    passVar,
+                    passVar,
+                    typeName
+                )
+            )
+            addLine(lines, 2, "return false")
             addLine(lines, 1, "end")
         end
     end

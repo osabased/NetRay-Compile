@@ -28,6 +28,7 @@ local nextTemp = Utilities.nextTemp
 local splitParams = Utilities.splitParams
 local paramNames = Utilities.paramNames
 local toLuauType = Utilities.toLuauType
+local pollingReturnTypes = Utilities.pollingReturnTypes
 local typedParamList = Utilities.typedParamList
 local returnTypeExpr = Utilities.returnTypeExpr
 local callbackTypeExpr = Utilities.callbackTypeExpr
@@ -265,8 +266,8 @@ local function emitQueue(
         addLine(lines, 0, ("local %s_PASS_VALUES: { unknown } = table.create(DEFAULT_BATCH_CAPACITY)"):format(upper))
         addLine(lines, 0, ("local %s_PASS_SIZE = 0"):format(upper))
     end
-    addLine(lines, 0, ("local %s_ENDS = {}"):format(upper))
-    addLine(lines, 0, ("local %s_IDS = {}"):format(upper))
+    addLine(lines, 0, ("local %s_ENDS: { number } = {}"):format(upper))
+    addLine(lines, 0, ("local %s_IDS: { number } = {}"):format(upper))
     local flushSource = [[
 local function FlushPREFIX()
     if UPPER_QUEUE_SIZE == 0 then return end
@@ -611,12 +612,24 @@ local function emitCommonRuntimePreamble(lines: { string }, schema: Analyzer.Ana
         for _, metric in metrics do
             if schema.limits[metric[2]] > 0 or schema.limits[metric[3]] > 0 then enabled = true end
         end
-        addLine(lines, 0, "local ReceiveBudgets = setmetatable({}, { __mode = \"k\" })")
+        local budgetFields: { string } = { "time: number" }
+        local budgetInit: { string } = { "time = now" }
+        for _, metric in metrics do
+            local burst, rate = schema.limits[metric[2]], schema.limits[metric[3]]
+            if burst > 0 or rate > 0 then
+                budgetFields[#budgetFields + 1] = metric[1] .. ": number"
+                budgetInit[#budgetInit + 1] = ("%s = %s"):format(metric[1], burst > 0 and burst or rate)
+            end
+        end
+        if enabled then
+            addLine(lines, 0, ("type ReceiveBudget = { %s }"):format(join(budgetFields)))
+            addLine(lines, 0, "local ReceiveBudgets: { [Player]: ReceiveBudget } = setmetatable({}, { __mode = \"k\" })")
+        end
         addLine(lines, 0, "local function Admit(player: Player, byteCost: number?, messageCost: number): boolean")
         if enabled then
             addLine(lines, 1, "local now = os.clock()")
             addLine(lines, 1, "local state = ReceiveBudgets[player]")
-            addLine(lines, 1, "if state == nil then state = { time = now }; ReceiveBudgets[player] = state end")
+            addLine(lines, 1, ("if state == nil then state = { %s }; ReceiveBudgets[player] = state end"):format(join(budgetInit)))
             addLine(lines, 1, "local elapsed = math.max(0, now - state.time)")
             addLine(lines, 1, "state.time = now")
             for _, metric in metrics do
@@ -624,7 +637,7 @@ local function emitCommonRuntimePreamble(lines: { string }, schema: Analyzer.Ana
                 if burst > 0 or rate > 0 then
                     if burst == 0 then burst = rate end
                     if rate == 0 then rate = burst end
-                    addLine(lines, 1, ("state.%s = math.min(%s, (state.%s or %s) + elapsed * %s)"):format(metric[1], burst, metric[1], burst, rate))
+                    addLine(lines, 1, ("state.%s = math.min(%s, state.%s + elapsed * %s)"):format(metric[1], burst, metric[1], rate))
                     local cost = metric[1] == "calls" and "(byteCost ~= nil and 1 or 0)" or (metric[1] == "bytes" and "(byteCost or 0)" or "messageCost")
                     addLine(lines, 1, ("if state.%s < %s then return false end"):format(metric[1], cost))
                     addLine(lines, 1, ("state.%s -= %s"):format(metric[1], cost))
@@ -904,11 +917,9 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
     addLine(lines, 0, ("local MAX_RELIABLE_ID = %d"):format(maxReliableId))
     addLine(lines, 0, ("local MAX_UNRELIABLE_ID = %d"):format(maxUnreliableId))
     addLine(lines, 0, ("local MAX_FUNCTION_ID = %d"):format(maxFunctionId))
-    addLine(lines, 0, "local RELIABLE_DISPATCH: { Dispatch } = table.create(MAX_RELIABLE_ID)")
-    addLine(lines, 0, "local UNRELIABLE_DISPATCH: { Dispatch } = table.create(MAX_UNRELIABLE_ID)")
-    addLine(lines, 0, "local RELIABLE_SKIP: { Dispatch } = table.create(MAX_RELIABLE_ID)")
-    addLine(lines, 0, "local UNRELIABLE_SKIP: { Dispatch } = table.create(MAX_UNRELIABLE_ID)")
-    addLine(lines, 0, "local FUNCTION_DISPATCH: { Dispatch } = table.create(MAX_FUNCTION_ID)")
+    addLine(lines, 0, "local RELIABLE_DISPATCH = table.create(MAX_RELIABLE_ID) :: { Dispatch }")
+    addLine(lines, 0, "local UNRELIABLE_DISPATCH = table.create(MAX_UNRELIABLE_ID) :: { Dispatch }")
+    addLine(lines, 0, "local FUNCTION_DISPATCH = table.create(MAX_FUNCTION_ID) :: { Dispatch }")
     if schema.maxPassArgs.reliable > 0 or schema.maxPassArgs.unreliable > 0 then
         -- Passthrough values travel as the remote call's own arguments; Studio delivered 4096 of them in one call.
         addLine(lines, 0, "local MAX_PASS_VALUES = 4096")
@@ -926,7 +937,7 @@ local function generateRuntime(schema: Analyzer.AnalyzedSchema, isServer: boolea
     if hasCompression then
         Compression.emit(lines)
         addLine(lines, 0, "local CompressionWidths: { [number]: FieldWidths } = {}")
-        if not isServer then addLine(lines, 0, "local ReceiveCompression = nil") end
+        if not isServer then addLine(lines, 0, "local ReceiveCompression: CompressionState? = nil") end
         for _, info in messages do
             if info.message.compression ~= nil then
                 local widths = {}
@@ -1046,7 +1057,7 @@ end)
             targetedSource = string.gsub(targetedSource, "PASS_COLLECT", "")
             targetedSource = string.gsub(targetedSource, " PASS_ARGS", "")
         end
-        targetedSource = string.gsub(targetedSource, "COMPRESSION_DECL", hasCompression and 'local TargetCompression = setmetatable({}, { __mode = "k" })' or "")
+        targetedSource = string.gsub(targetedSource, "COMPRESSION_DECL", hasCompression and 'local TargetCompression: { [Player]: CompressionState } = setmetatable({}, { __mode = "k" })' or "")
         targetedSource = string.gsub(targetedSource, "COMPRESSION_STATE", hasCompression and "local nextState: CompressionState? = __nr_cloneCompressionState(TargetCompression[player])" or "")
         targetedSource = string.gsub(targetedSource, "COMPRESSION_RECORD", hasCompression and ([[local id = %s(record, 0)
             local widths: FieldWidths? = CompressionWidths[id]
@@ -1173,8 +1184,10 @@ end)
             local handlerCountName = "HandlerCount_" .. symbol
 
             local callbackArgs: { string } = {}
+            local callbackArgTypes: { string } = {}
             if isServer then
                 callbackArgs[#callbackArgs + 1] = "player"
+                callbackArgTypes[#callbackArgTypes + 1] = "Player"
             end
             local serializedIndex = 0
             local passthroughIndex = 0
@@ -1182,12 +1195,16 @@ end)
                 local param = message.params[paramIndex]
                 if param.type.kind == "passthrough" then
                     passthroughIndex += 1
-                    callbackArgs[#callbackArgs + 1] = ("pass%d"):format(passthroughIndex)
+                    -- The passthrough validator has already checked the value against this type.
+                    local passType = toLuauType(param.type)
+                    callbackArgs[#callbackArgs + 1] = ("pass%d :: %s"):format(passthroughIndex, passType)
+                    callbackArgTypes[#callbackArgTypes + 1] = passType
                 else
                     serializedIndex += 1
-                    local leafNames = requestDecodePlans[serializedIndex].leafNames
-                    for leafIndex = 1, #leafNames do
-                        callbackArgs[#callbackArgs + 1] = leafNames[leafIndex]
+                    local leaves = requestDecodePlans[serializedIndex].leaves
+                    for leafIndex = 1, #leaves do
+                        callbackArgs[#callbackArgs + 1] = leaves[leafIndex].targetName
+                        callbackArgTypes[#callbackArgTypes + 1] = toLuauType(leaves[leafIndex].typeDef)
                     end
                 end
             end
@@ -1197,7 +1214,7 @@ end)
             local pollingTailName = "PollTail_" .. symbol
             local pollingArgNames: { string } = {}
             if canEmitOn and isServer and message.rate ~= nil then
-                addLine(lines, 0, 'local EventBudgets = setmetatable({}, { __mode = "k" })')
+                addLine(lines, 0, 'local EventBudgets: { [Player]: { time: number, tokens: number } } = setmetatable({}, { __mode = "k" })')
             end
             if canEmitOn and eventIsPolling then
                 addLine(lines, 0, ("local %s = 1"):format(pollingHeadName))
@@ -1205,22 +1222,20 @@ end)
                 for argIndex = 1, #callbackArgs do
                     local pollArgName = ("PollArg_%d_%s"):format(argIndex, symbol)
                     pollingArgNames[#pollingArgNames + 1] = pollArgName
-                    addLine(lines, 0, ("local %s = table.create(DEFAULT_BATCH_CAPACITY)"):format(pollArgName))
+                    addLine(lines, 0, ("local %s = table.create(DEFAULT_BATCH_CAPACITY) :: { %s }"):format(pollArgName, callbackArgTypes[argIndex]))
                 end
                 addLine(lines, 0, "")
             end
 
             if canEmitOn and eventIsMany then
-                addLine(lines, 0, ("local %s = {}"):format(handlerListName))
-                addLine(lines, 0, ("local %s = {}"):format(handlerFreeSlotsName))
+                addLine(lines, 0, ("local %s: { %s } = {}"):format(handlerListName, eventCallbackType))
+                addLine(lines, 0, ("local %s: { number } = {}"):format(handlerFreeSlotsName))
                 addLine(lines, 0, ("local %s = 0"):format(handlerCountName))
                 addLine(lines, 0, "")
             end
 
             if canEmitFire or (canEmitOn and (message.max ~= nil or (isServer and message.rate ~= nil))) then
                 emitSkipFunction(lines, skipName, info.serializedParams, info.fullName, validateLevel, schema.structByName)
-                local skipDispatchVar = message.category == "unreliable" and "UNRELIABLE_SKIP" or "RELIABLE_SKIP"
-                addLine(lines, 0, ("%s[%d] = %s"):format(skipDispatchVar, message.id, skipName))
                 addLine(lines, 0, "")
             end
 
@@ -1507,11 +1522,13 @@ end)
 
             if canEmitOn then
                 if eventIsPolling then
-                    addLine(lines, 0, ("function %s.Iter()"):format(symbol))
-                    addLine(lines, 1, "return function()")
+                    local iterReturns = pollingReturnTypes(callbackArgTypes)
+                    local emptyReturns: { string } = table.create(#callbackArgTypes + 1, "nil")
+                    addLine(lines, 0, ("function %s.Iter(): () -> (%s)"):format(symbol, iterReturns))
+                    addLine(lines, 1, ("return function(): (%s)"):format(iterReturns))
                     addLine(lines, 2, ("local __nr_head = %s"):format(pollingHeadName))
                     addLine(lines, 2, ("if __nr_head > %s then"):format(pollingTailName))
-                    addLine(lines, 3, "return nil")
+                    addLine(lines, 3, ("return %s"):format(join(emptyReturns)))
                     addLine(lines, 2, "end")
                     addLine(lines, 2, schema.limits.MaxPollingMessages == 0 and "local __nr_slot = __nr_head" or "local __nr_slot = (__nr_head - 1) % MaxPollingMessages + 1")
                     local pollReturnVars: { string } = {}

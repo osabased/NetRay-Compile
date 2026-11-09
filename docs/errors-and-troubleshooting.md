@@ -23,6 +23,7 @@
 - `E_DUP_DECL`: name collision between struct/enum/set declarations.
 - `Invalid Validate option value ...`
 - `Invalid TypeBranding option value ...`
+- `TypeBranding = On is not supported ...`: Luau's new type solver can't create or do arithmetic on branded numbers. Remove the option or set it to `Off`.
 - `Invalid DecodeStruct option value ...`
 - `Duplicate option ...` / `Duplicate event property ...`
 - `Event compression requires a reliable event`

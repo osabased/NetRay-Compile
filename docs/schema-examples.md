@@ -65,7 +65,6 @@ scope Gameplay {
 ## Options
 ```rust
 option Validate = Full;
-option TypeBranding = On;
 option DecodeStruct = Table;
 ```
 

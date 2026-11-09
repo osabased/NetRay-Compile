@@ -7,7 +7,7 @@ No options are required. An existing schema keeps `Validate = Off`, `TypeBrandin
 | Option | Values | Default | Effect |
 | :--- | :--- | :--- | :--- |
 | `Validate` | `Off`, `Basic`, `Full` | `Off` | Controls additional payload validation. |
-| `TypeBranding` | `Off`, `On` | `Off` | Emits plain numeric aliases or branded numeric types. |
+| `TypeBranding` | `Off` | `Off` | Emits plain numeric aliases (`u16 = number`). `On` is rejected: Luau's new type solver can't create or do arithmetic on branded numbers. |
 | `DecodeStruct` | `Locals`, `Table` | `Locals` | Expands top-level struct arguments into callback arguments, or preserves their tables. |
 | `remote_scope` | String or identifier | Compiler fallback, then `NetRay` | Names the three remotes; overrides the CLI/plugin fallback scope. |
 
